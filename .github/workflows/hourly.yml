@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
 
   schedule:
-    # Runs at the start of every hour
     - cron: "0 * * * *"
 
 permissions:
@@ -29,11 +28,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run job hunter
+      - name: Test AI job matcher
         env:
-          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
-          GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python agent/main.py
+          cd agent
+          python test_matcher.py
