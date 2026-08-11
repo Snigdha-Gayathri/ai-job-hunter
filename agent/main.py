@@ -22,23 +22,17 @@ def search_jobs():
     }
 
     payload = {
-        "searchQueries": [
-            "AI Engineer",
-            "Machine Learning Engineer",
-            "ML Engineer",
-            "Generative AI",
-            "LLM Engineer",
-            "RAG Engineer",
-            "AI/ML Engineer"
-        ],
+        "searchQuery": "AI Engineer",
         "location": "India",
         "maxJobs": 50,
         "jobType": "F",
         "experienceLevel": "2",
-        "datePosted": "r259200",
+        "datePosted": "r604800",
         "sortBy": "DD",
         "scrapeJobDetails": True
     }
+
+    print("Sending request to Apify...")
 
     response = requests.post(
         APIFY_URL,
@@ -46,6 +40,8 @@ def search_jobs():
         json=payload,
         timeout=180
     )
+
+    print(f"Apify HTTP status: {response.status_code}")
 
     response.raise_for_status()
 
@@ -79,10 +75,12 @@ def send_email(jobs):
     ]
 
     for index, job in enumerate(jobs[:20], start=1):
+
         title = job.get("title", "Unknown title")
         company = job.get("companyName", "Unknown company")
         location = job.get("location", "Unknown location")
         posted = job.get("postedAt", "Unknown")
+
         url = (
             job.get("applyUrl")
             or job.get("jobUrl")
@@ -103,19 +101,34 @@ def send_email(jobs):
 
     message.set_content("\n".join(lines))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(username, app_password)
+    print("Connecting to Gmail...")
+
+    with smtplib.SMTP_SSL(
+        "smtp.gmail.com",
+        465
+    ) as server:
+
+        server.login(
+            username,
+            app_password
+        )
+
         server.send_message(message)
 
 
 def main():
-    print("Starting Apify job search...")
+
+    print("=" * 60)
+    print("AI JOB HUNTER STARTED")
+    print("=" * 60)
 
     jobs = search_jobs()
 
     print(f"Jobs returned: {len(jobs)}")
+    print()
 
     for job in jobs[:10]:
+
         print(
             f"{job.get('title')} | "
             f"{job.get('companyName')} | "
@@ -123,11 +136,13 @@ def main():
             f"{job.get('postedAt')}"
         )
 
+    print()
     print("Sending email...")
 
     send_email(jobs)
 
     print("Email sent successfully.")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
