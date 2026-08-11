@@ -113,20 +113,37 @@ def extract_json(text):
             f"Model did not return valid JSON:\n{text}"
         )
 
-    return json.loads(text[start:end + 1])
+    return json.loads(
+        text[start:end + 1]
+    )
 
 
 def score_job(job):
 
-    title = job.get("title", "")
-    company = job.get("companyName", "")
-    location = job.get("location", "")
+    title = job.get(
+        "title",
+        ""
+    )
+
+    company = job.get(
+        "companyName",
+        ""
+    )
+
+    location = job.get(
+        "location",
+        ""
+    )
 
     description = (
-        job.get("descriptionHtml")
-        or job.get("description")
+        job.get("description")
+        or job.get("descriptionHtml")
         or ""
     )
+
+    # Prevent excessively large job descriptions
+    # from unnecessarily increasing the prompt size.
+    description = str(description)[:15000]
 
     prompt = f"""
 You are an expert technical recruiter.
@@ -134,14 +151,13 @@ You are an expert technical recruiter.
 Your task is to determine how strongly this job matches
 the candidate described below.
 
-CANDIDATE PROFILE
-=================
+
+# CANDIDATE PROFILE
 
 {CANDIDATE_PROFILE}
 
 
-JOB
-===
+# JOB
 
 Title:
 {title}
@@ -156,8 +172,7 @@ Description:
 {description}
 
 
-IMPORTANT EVALUATION RULES
-==========================
+# IMPORTANT EVALUATION RULES
 
 1. The candidate is a 2026 graduate targeting entry-level
    and junior AI/ML engineering roles.
@@ -166,6 +181,7 @@ IMPORTANT EVALUATION RULES
    professional experience.
 
 3. Strongly penalize:
+
    - Senior
    - Lead
    - Staff
@@ -182,6 +198,7 @@ IMPORTANT EVALUATION RULES
 6. Prioritize actual technical overlap over keyword overlap.
 
 7. Strong positive signals include:
+
    - Python
    - Machine Learning
    - Deep Learning
@@ -204,6 +221,7 @@ IMPORTANT EVALUATION RULES
 8. Projects count as legitimate evidence of technical ability.
 
 9. Distinguish between:
+
    - required qualifications
    - preferred qualifications
    - responsibilities
@@ -218,9 +236,25 @@ IMPORTANT EVALUATION RULES
 
 13. Be conservative and honest.
 
+14. Do not give a high score merely because the job contains
+    many AI keywords.
 
-SCORING
-=======
+15. If the role is primarily software engineering, data
+    engineering, QA, support, business analysis, or another
+    non-AI discipline with only minor AI exposure, reduce
+    the score accordingly.
+
+16. If the job explicitly requires more experience than a
+    fresh graduate can reasonably satisfy, reflect that
+    heavily in the score.
+
+17. Evaluate the actual responsibilities, not just the title.
+
+18. A strong project match is valuable evidence, but projects
+    must not be presented as professional employment.
+
+
+# SCORING
 
 90-100:
 Exceptional match. Candidate should strongly consider applying.
