@@ -1,0 +1,28 @@
+name: Hourly AI Job Hunter
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "0 * * * *"
+
+jobs:
+  job-hunt:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run job hunter
+        run: |
+          python agent/main.py
