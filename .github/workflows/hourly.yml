@@ -1,13 +1,15 @@
-name: AI Job Matcher Test
+name: Hourly AI Job Hunter
 
 on:
+  schedule:
+    - cron: "0 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  test-matcher:
+  job-hunt:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,9 +26,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Test AI job matcher
+      - name: Run AI Job Hunter
         env:
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: |
           cd agent
-          python test_matcher.py
+          python main.py
