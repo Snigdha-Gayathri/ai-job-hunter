@@ -27,5 +27,6 @@ jobs:
         env:
           GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
         run: |
           python agent/main.py
