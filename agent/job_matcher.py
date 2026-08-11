@@ -7,7 +7,7 @@ GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 
 MODEL_URL = "https://models.github.ai/inference/chat/completions"
 
-MODEL = "openai/gpt-4o-mini"
+MODEL = "openai/gpt-4.1"
 
 
 CANDIDATE_PROFILE = """
@@ -211,13 +211,14 @@ WEAK_MATCH
 """
 
 
-    response = requests.post(
-        MODEL_URL,
-        headers={
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "Content-Type": "application/json",
-            "Accept": "application/vnd.github+json"
-        },
+   response = requests.post(
+    MODEL_URL,
+    headers={
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2026-03-10"
+    },
         json={
             "model": MODEL,
             "messages": [
