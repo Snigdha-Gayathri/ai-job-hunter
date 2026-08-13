@@ -1,615 +1,12 @@
+import json
 import os
 import re
 import smtplib
-import requests
-
-from email.message import EmailMessage
 from datetime import datetime, timezone, timedelta
-
-from job_matcher import score_job
-
-
-APIFY_TOKEN = os.environ["APIFY_API_TOKEN"]
-
-ACTOR_ID = "automation-lab~linkedin-jobs-scraper"
-
-APIFY_URL = (
-    f"https://api.apify.com/v2/acts/"
-    f"{ACTOR_ID}/run-sync-get-dataset-items"
-)
-
-MAX_EMAIL_JOBS = 20
-MAX_SCRAPED_JOBS = 50
-MAX_JOB_AGE_HOURS = 72
-MIN_MATCH_SCORE = 75
-
-
-def search_jobs():
-    params = {
-        "token": APIFY_TOKEN
-    }
-
-    payload = {
-        "searchQuery": (
-            "AI Engineer Machine Learning Engineer "
-            "ML Engineer Generative AI LLM RAG"
-        ),
-        "location": "India",
-        "maxJobs": MAX_SCRAPED_JOBS,
-        "jobType": "F",
-        "experienceLevel": "2",
-        "datePosted": "r604800",
-        "sortBy": "DD",
-        "scrapeJobDetails": True
-    }
-
-    print("Sending request to Apify...")
-
-    response = requests.post(
-        APIFY_URL,
-        params=params,
-        json=payload,
-        timeout=180
-    )
-
-    print(f"Apify HTTP status: {response.status_code}")
-
-    if response.status_code != 200:
-        print("Apify response:")
-        print(response.text[:3000])
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-def parse_posted_time(job):
-    """
-    Try to convert the Actor's posting timestamp into
-    a timezone-aware datetime.
-    """
-
-    raw = (
-        job.get("postedAt")
-        or job.get("postedDate")
-        or job.get("postedAtText")
-        or ""
-    )
-
-    if not raw:
-        return None
-
-    raw = str(raw).strip()
-
-    # ISO 8601 timestamp
-    try:
-        normalized = raw.replace("Z", "+00:00")
-
-        dt = datetime.fromisoformat(
-            normalized
-        )
-
-        if dt.tzinfo is None:
-            dt = dt.replace(
-                tzinfo=timezone.utc
-            )
-
-        return dt.astimezone(
-            timezone.utc
-        )
-
-    except ValueError:
-        pass
-
-    # Relative LinkedIn-style text
-    text = raw.lower()
-
-    now = datetime.now(timezone.utc)
-
-    match = re.search(
-        r"(\d+)\s*(minute|hour|day|week)",
-        text
-    )
-
-    if match:
-        value = int(match.group(1))
-        unit = match.group(2)
-
-        if unit == "minute":
-            return now - timedelta(
-                minutes=value
-            )
-
-        if unit == "hour":
-            return now - timedelta(
-                hours=value
-            )
-
-        if unit == "day":
-            return now - timedelta(
-                days=value
-            )
-
-        if unit == "week":
-            return now - timedelta(
-                weeks=value
-            )
-
-    if (
-        "just now" in text
-        or "today" in text
-    ):
-        return now
-
-    return None
-
-
-def filter_recent_jobs(jobs):
-    """
-    Keep only jobs posted within the last 72 hours.
-    """
-
-    cutoff = (
-        datetime.now(timezone.utc)
-        - timedelta(
-            hours=MAX_JOB_AGE_HOURS
-        )
-    )
-
-    recent = []
-    unknown_timestamp = []
-
-    for job in jobs:
-
-        posted_time = parse_posted_time(
-            job
-        )
-
-        if posted_time is None:
-            unknown_timestamp.append(
-                job
-            )
-            continue
-
-        if posted_time >= cutoff:
-
-            job["_parsed_posted_time"] = (
-                posted_time.isoformat()
-            )
-
-            recent.append(job)
-
-    print(
-        f"Jobs from Apify: {len(jobs)}"
-    )
-
-    print(
-        f"Jobs within 72 hours: "
-        f"{len(recent)}"
-    )
-
-    print(
-        f"Jobs with unknown posting time: "
-        f"{len(unknown_timestamp)}"
-    )
-
-    return recent
-
-
-def deduplicate_jobs(jobs):
-    """
-    Remove duplicate postings using
-    the strongest available identifier.
-    """
-
-    seen = set()
-    unique = []
-
-    for job in jobs:
-
-        job_id = (
-            job.get("jobId")
-            or job.get("id")
-            or job.get("jobUrl")
-            or job.get("url")
-        )
-
-        if not job_id:
-
-            job_id = (
-                f"{job.get('title', '').strip().lower()}|"
-                f"{job.get('companyName', '').strip().lower()}"
-            )
-
-        if job_id in seen:
-            continue
-
-        seen.add(job_id)
-        unique.append(job)
-
-    print(
-        f"Unique jobs: {len(unique)}"
-    )
-
-    return unique
-
-
-def score_and_rank_jobs(jobs):
-    """
-    Score each job with the Groq AI matcher,
-    keep strong matches, and rank them by score.
-    """
-
-    scored_jobs = []
-
-    print()
-    print("=" * 70)
-    print("AI MATCHING STARTED")
-    print("=" * 70)
-
-    for index, job in enumerate(
-        jobs,
-        start=1
-    ):
-
-        print(
-            f"[{index}/{len(jobs)}] "
-            f"{job.get('title', 'Unknown title')} | "
-            f"{job.get('companyName', 'Unknown company')}"
-        )
-
-        try:
-            result = score_job(job)
-
-            job["match_score"] = result.get(
-                "match_score",
-                0
-            )
-
-            job["qualification"] = result.get(
-                "qualification",
-                "UNKNOWN"
-            )
-
-            job["experience_fit"] = result.get(
-                "experience_fit",
-                "UNKNOWN"
-            )
-
-            job["technical_fit"] = result.get(
-                "technical_fit",
-                0
-            )
-
-            job["role_fit"] = result.get(
-                "role_fit",
-                0
-            )
-
-            job["key_matches"] = result.get(
-                "key_matches",
-                []
-            )
-
-            job["missing_requirements"] = result.get(
-                "missing_requirements",
-                []
-            )
-
-            job["concerns"] = result.get(
-                "concerns",
-                []
-            )
-
-            job["match_reason"] = result.get(
-                "reason",
-                ""
-            )
-
-            print(
-                f"    Match score: "
-                f"{job['match_score']}/100"
-            )
-
-            if job["match_score"] >= MIN_MATCH_SCORE:
-                scored_jobs.append(job)
-
-        except Exception as error:
-
-            print(
-                f"    Matcher failed: {error}"
-            )
-
-            continue
-
-    scored_jobs.sort(
-        key=lambda job: job.get(
-            "match_score",
-            0
-        ),
-        reverse=True
-    )
-
-    print()
-    print(
-        f"Jobs meeting "
-        f"{MIN_MATCH_SCORE}+ threshold: "
-        f"{len(scored_jobs)}"
-    )
-
-    print()
-    print("TOP MATCHES")
-    print("-" * 70)
-
-    for index, job in enumerate(
-        scored_jobs[:MAX_EMAIL_JOBS],
-        start=1
-    ):
-
-        print(
-            f"{index}. "
-            f"{job.get('match_score', 0)}/100 | "
-            f"{job.get('title', 'Unknown')} | "
-            f"{job.get('companyName', 'Unknown')}"
-        )
-
-    return scored_jobs
-
-
-def send_email(jobs):
-    username = os.environ["GMAIL_USERNAME"]
-    app_password = os.environ["GMAIL_APP_PASSWORD"]
-
-    message = EmailMessage()
-
-    message["From"] = username
-    message["To"] = username
-
-    message["Subject"] = (
-        f"AI Job Hunter - "
-        f"{len(jobs[:MAX_EMAIL_JOBS])} High-Match Jobs"
-    )
-
-    now = datetime.now(
-        timezone.utc
-    ).strftime(
-        "%Y-%m-%d %H:%M UTC"
-    )
-
-    lines = [
-        "AI JOB HUNTER - AI MATCHED REPORT",
-        "",
-        f"Run time: {now}",
-        f"High-match jobs: "
-        f"{len(jobs[:MAX_EMAIL_JOBS])}",
-        "",
-        "Freshness filter: "
-        "Posted within the last 72 hours",
-        f"AI match threshold: "
-        f"{MIN_MATCH_SCORE}/100",
-        "",
-        "=" * 70,
-        ""
-    ]
-
-    if not jobs:
-
-        lines.extend([
-            "No jobs met the AI match threshold.",
-            "",
-            "The agent will search again during "
-            "the next run.",
-            "",
-            "=" * 70,
-            ""
-        ])
-
-    for index, job in enumerate(
-        jobs[:MAX_EMAIL_JOBS],
-        start=1
-    ):
-
-        title = job.get(
-            "title",
-            "Unknown title"
-        )
-
-        company = job.get(
-            "companyName",
-            "Unknown company"
-        )
-
-        location = job.get(
-            "location",
-            "Unknown location"
-        )
-
-        posted = (
-            job.get("postedAt")
-            or job.get("postedDate")
-            or job.get("postedAtText")
-            or "Unknown"
-        )
-
-        apply_url = (
-            job.get("applyUrl")
-            or job.get("jobUrl")
-            or job.get("url")
-            or "No application URL"
-        )
-
-        linkedin_url = (
-            job.get("jobUrl")
-            or job.get("url")
-            or "No LinkedIn URL"
-        )
-
-        match_score = job.get(
-            "match_score",
-            0
-        )
-
-        qualification = job.get(
-            "qualification",
-            "UNKNOWN"
-        )
-
-        experience_fit = job.get(
-            "experience_fit",
-            "UNKNOWN"
-        )
-
-        technical_fit = job.get(
-            "technical_fit",
-            0
-        )
-
-        role_fit = job.get(
-            "role_fit",
-            0
-        )
-
-        key_matches = job.get(
-            "key_matches",
-            []
-        )
-
-        missing_requirements = job.get(
-            "missing_requirements",
-            []
-        )
-
-        concerns = job.get(
-            "concerns",
-            []
-        )
-
-        reason = job.get(
-            "match_reason",
-            ""
-        )
-
-        lines.extend([
-            f"{index}. {title}",
-            "",
-            f"AI MATCH SCORE: "
-            f"{match_score}/100",
-            f"Qualification: "
-            f"{qualification}",
-            f"Experience fit: "
-            f"{experience_fit}",
-            f"Technical fit: "
-            f"{technical_fit}/100",
-            f"Role fit: "
-            f"{role_fit}/100",
-            "",
-            f"Company: {company}",
-            f"Location: {location}",
-            f"Posted: {posted}",
-            "",
-            f"Apply: {apply_url}",
-            f"LinkedIn: {linkedin_url}",
-            "",
-            "WHY IT MATCHES:",
-            reason,
-            ""
-        ])
-
-        if key_matches:
-
-            lines.append(
-                "KEY MATCHES:"
-            )
-
-            for item in key_matches:
-                lines.append(
-                    f"  + {item}"
-                )
-
-            lines.append("")
-
-        if missing_requirements:
-
-            lines.append(
-                "MISSING REQUIREMENTS:"
-            )
-
-            for item in missing_requirements:
-                lines.append(
-                    f"  - {item}"
-                )
-
-            lines.append("")
-
-        if concerns:
-
-            lines.append(
-                "CONCERNS:"
-            )
-
-            for item in concerns:
-                lines.append(
-                    f"  ! {item}"
-                )
-
-            lines.append("")
-
-        lines.extend([
-            "-" * 70,
-            ""
-        ])
-
-    message.set_content(
-        "\n".join(lines)
-    )
-
-    print(
-        "Connecting to Gmail..."
-    )
-
-    with smtplib.SMTP_SSL(
-        "smtp.gmail.com",
-        465
-    ) as server:
-
-        server.login(
-            username,
-            app_password
-        )
-
-        server.send_message(
-            message
-        )
-
-
-def main():
-
-    print("=" * 70)
-    print("AI JOB HUNTER STARTED")
-    print("=" * 70)
-
-    jobs = search_jobs()
-
-    recent_jobs = filter_recent_jobs(
-        jobs
-    )
-
-    unique_jobs = deduplicate_jobs(
-        recent_jobs
-    )
-
-    matched_jobs = score_and_rank_jobs(
-        unique_jobs
-    )import json
-import os
-import re
-import smtplib
-
-import requests
-
 from email.message import EmailMessage
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+import requests
 
 from job_matcher import (
     locally_filter_jobs,
@@ -617,6 +14,10 @@ from job_matcher import (
 )
 
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 APIFY_TOKEN = os.environ["APIFY_API_TOKEN"]
 
 ACTOR_ID = "automation-lab~linkedin-jobs-scraper"
@@ -626,38 +27,29 @@ APIFY_URL = (
     f"{ACTOR_ID}/run-sync-get-dataset-items"
 )
 
-
-# ---------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------
-
 MAX_EMAIL_JOBS = 20
 MAX_SCRAPED_JOBS = 50
-
-# Jobs newer than this are considered fresh.
 MAX_JOB_AGE_HOURS = 72
-
-# Final AI/local threshold.
 MIN_MATCH_SCORE = 75
 
-# Persistent state.
+# Persistent state directory.
 STATE_DIR = Path("state")
 STATE_FILE = STATE_DIR / "seen_jobs.json"
 
-# Keep the state bounded.
+# Prevent the state file from growing forever.
 MAX_SEEN_JOBS = 5000
 
 
-# ---------------------------------------------------------
-# STATE
-# ---------------------------------------------------------
+# ============================================================
+# STATE MANAGEMENT
+# ============================================================
 
-def load_state() -> dict:
+def load_state():
     """
-    Load persistent job state.
+    Load persistent job state from disk.
 
-    GitHub Actions restores this directory from the
-    Actions cache before main.py starts.
+    The GitHub Actions workflow restores this directory
+    from the Actions cache before running main.py.
     """
 
     STATE_DIR.mkdir(
@@ -667,7 +59,7 @@ def load_state() -> dict:
 
     if not STATE_FILE.exists():
         return {
-            "jobs": {},
+            "jobs": {}
         }
 
     try:
@@ -678,26 +70,31 @@ def load_state() -> dict:
             state = json.load(file)
 
         if not isinstance(state, dict):
-            raise ValueError("Invalid state format.")
+            raise ValueError(
+                "State file does not contain a JSON object."
+            )
 
         if "jobs" not in state:
+            state["jobs"] = {}
+
+        if not isinstance(state["jobs"], dict):
             state["jobs"] = {}
 
         return state
 
     except Exception as error:
         print(
-            f"Could not load state: {error}"
+            f"WARNING: Could not load state file: {error}"
         )
 
         return {
-            "jobs": {},
+            "jobs": {}
         }
 
 
-def save_state(state: dict) -> None:
+def save_state(state):
     """
-    Persist job state.
+    Save persistent job state to disk.
     """
 
     STATE_DIR.mkdir(
@@ -705,9 +102,12 @@ def save_state(state: dict) -> None:
         exist_ok=True,
     )
 
-    # Keep only the newest MAX_SEEN_JOBS records.
-    jobs = state.get("jobs", {})
+    jobs = state.get(
+        "jobs",
+        {},
+    )
 
+    # Keep only the newest MAX_SEEN_JOBS records.
     if len(jobs) > MAX_SEEN_JOBS:
         sorted_items = sorted(
             jobs.items(),
@@ -732,10 +132,21 @@ def save_state(state: dict) -> None:
             indent=2,
         )
 
+    print(
+        f"State saved: {len(state['jobs'])} jobs tracked."
+    )
 
-def get_job_id(job: dict) -> str:
+
+def get_job_id(job):
     """
-    Generate the strongest available stable identifier.
+    Generate a stable identifier for a job.
+
+    Preference order:
+    1. jobId
+    2. id
+    3. jobUrl
+    4. url
+    5. title + company + location
     """
 
     job_id = (
@@ -760,20 +171,23 @@ def get_job_id(job: dict) -> str:
         job.get("location") or ""
     ).strip().lower()
 
-    return f"{title}|{company}|{location}"
+    return (
+        f"{title}|{company}|{location}"
+    )
 
 
 def remove_previously_seen_jobs(
-    jobs: list[dict],
-    state: dict,
-) -> list[dict]:
+    jobs,
+    state,
+):
     """
-    Remove jobs already processed by previous runs.
+    Remove jobs that have already been processed
+    by previous workflow runs.
 
-    ZERO API calls.
+    This performs ZERO external API calls.
     """
 
-    seen = state.setdefault(
+    seen_jobs = state.setdefault(
         "jobs",
         {},
     )
@@ -784,19 +198,25 @@ def remove_previously_seen_jobs(
         timezone.utc
     ).isoformat()
 
+    skipped_count = 0
+
     for job in jobs:
         job_id = get_job_id(job)
 
         job["_job_id"] = job_id
 
-        if job_id in seen:
-            seen[job_id]["last_seen"] = now
+        if job_id in seen_jobs:
+            seen_jobs[job_id]["last_seen"] = now
+            skipped_count += 1
             continue
 
-        seen[job_id] = {
+        seen_jobs[job_id] = {
             "first_seen": now,
             "last_seen": now,
-            "title": job.get("title", ""),
+            "title": job.get(
+                "title",
+                "",
+            ),
             "company": job.get(
                 "companyName",
                 "",
@@ -811,19 +231,22 @@ def remove_previously_seen_jobs(
 
     print(
         f"Previously seen jobs skipped: "
-        f"{len(jobs) - len(new_jobs)}"
+        f"{skipped_count}"
     )
 
     return new_jobs
 
 
-# ---------------------------------------------------------
-# APIFY
-# ---------------------------------------------------------
+# ============================================================
+# APIFY JOB SEARCH
+# ============================================================
 
-def search_jobs() -> list[dict]:
+def search_jobs():
     """
-    Perform exactly ONE Apify request.
+    Make exactly ONE Apify API request.
+
+    Apify returns a batch of jobs which are then processed
+    locally.
     """
 
     params = {
@@ -841,22 +264,32 @@ def search_jobs() -> list[dict]:
         "experienceLevel": "2",
         "datePosted": "r604800",
         "sortBy": "DD",
-
-        # Keep this enabled because the job description is
-        # needed for local filtering and AI ranking.
         "scrapeJobDetails": True,
     }
+
+    print()
+    print("=" * 70)
+    print("APIFY JOB SEARCH")
+    print("=" * 70)
 
     print(
         "Sending ONE request to Apify..."
     )
 
-    response = requests.post(
-        APIFY_URL,
-        params=params,
-        json=payload,
-        timeout=180,
-    )
+    try:
+        response = requests.post(
+            APIFY_URL,
+            params=params,
+            json=payload,
+            timeout=180,
+        )
+
+    except requests.RequestException as error:
+        print(
+            f"Apify request failed: {error}"
+        )
+
+        return []
 
     print(
         f"Apify HTTP status: "
@@ -867,19 +300,58 @@ def search_jobs() -> list[dict]:
         print(
             "Apify rate limit reached."
         )
-        print(
-            "The run will stop without retrying."
+
+        retry_after = response.headers.get(
+            "Retry-After"
         )
+
+        if retry_after:
+            print(
+                f"Apify requested retry after "
+                f"{retry_after} seconds."
+            )
+
+        print(
+            "No retry will be performed during this run."
+        )
+
         return []
 
-    response.raise_for_status()
+    if response.status_code != 200:
+        print(
+            "Apify returned an error:"
+        )
 
-    data = response.json()
+        print(
+            response.text[:3000]
+        )
+
+        return []
+
+    try:
+        data = response.json()
+
+    except ValueError:
+        print(
+            "Apify returned invalid JSON."
+        )
+
+        print(
+            response.text[:3000]
+        )
+
+        return []
 
     if not isinstance(data, list):
-        raise ValueError(
-            "Apify returned an unexpected response."
+        print(
+            "Unexpected Apify response format."
         )
+
+        print(
+            type(data).__name__
+        )
+
+        return []
 
     print(
         f"Apify returned {len(data)} jobs."
@@ -888,15 +360,20 @@ def search_jobs() -> list[dict]:
     return data
 
 
-# ---------------------------------------------------------
-# DATE HANDLING
-# ---------------------------------------------------------
+# ============================================================
+# POSTING DATE PARSING
+# ============================================================
 
-def parse_posted_time(
-    job: dict,
-):
+def parse_posted_time(job):
     """
-    Convert common LinkedIn-style timestamps into UTC.
+    Convert the job's posting timestamp into
+    a timezone-aware UTC datetime.
+
+    Supports:
+    - ISO 8601
+    - relative LinkedIn-style timestamps
+    - 'today'
+    - 'just now'
     """
 
     raw = (
@@ -911,7 +388,10 @@ def parse_posted_time(
 
     raw = str(raw).strip()
 
-    # ISO 8601.
+    # --------------------------------------------------------
+    # ISO 8601
+    # --------------------------------------------------------
+
     try:
         normalized = raw.replace(
             "Z",
@@ -934,6 +414,10 @@ def parse_posted_time(
     except ValueError:
         pass
 
+    # --------------------------------------------------------
+    # Relative timestamps
+    # --------------------------------------------------------
+
     text = raw.lower()
 
     now = datetime.now(
@@ -941,7 +425,7 @@ def parse_posted_time(
     )
 
     match = re.search(
-        r"(\d+)\s*(minute|hour|day|week)",
+        r"(\d+)\s*(minute|minutes|hour|hours|day|days|week|weeks)",
         text,
     )
 
@@ -952,44 +436,49 @@ def parse_posted_time(
 
         unit = match.group(2)
 
-        if unit == "minute":
+        if unit.startswith("minute"):
             return now - timedelta(
                 minutes=value
             )
 
-        if unit == "hour":
+        if unit.startswith("hour"):
             return now - timedelta(
                 hours=value
             )
 
-        if unit == "day":
+        if unit.startswith("day"):
             return now - timedelta(
                 days=value
             )
 
-        if unit == "week":
+        if unit.startswith("week"):
             return now - timedelta(
                 weeks=value
             )
 
+    # --------------------------------------------------------
+    # Immediate timestamps
+    # --------------------------------------------------------
+
     if (
         "just now" in text
         or "today" in text
+        or "just posted" in text
     ):
         return now
 
     return None
 
 
-def filter_recent_jobs(
-    jobs: list[dict],
-) -> list[dict]:
+def filter_recent_jobs(jobs):
     """
-    Keep recent jobs.
+    Keep jobs posted within MAX_JOB_AGE_HOURS.
 
-    Jobs with unknown timestamps are retained only when
-    they are otherwise usable. This prevents the previous
-    behavior of silently throwing potentially valid jobs away.
+    Jobs whose timestamp cannot be parsed are retained
+    and allowed to pass to the local relevance filter.
+
+    This avoids accidentally discarding valid jobs because
+    the scraper returned an unfamiliar timestamp format.
     """
 
     cutoff = (
@@ -999,8 +488,8 @@ def filter_recent_jobs(
         )
     )
 
-    recent = []
-    unknown_timestamp = []
+    recent_jobs = []
+    unknown_timestamp_jobs = []
 
     for job in jobs:
         posted_time = parse_posted_time(
@@ -1008,7 +497,7 @@ def filter_recent_jobs(
         )
 
         if posted_time is None:
-            unknown_timestamp.append(
+            unknown_timestamp_jobs.append(
                 job
             )
             continue
@@ -1018,44 +507,47 @@ def filter_recent_jobs(
                 posted_time.isoformat()
             )
 
-            recent.append(job)
+            recent_jobs.append(
+                job
+            )
 
+    print()
     print(
         f"Jobs from Apify: {len(jobs)}"
     )
 
     print(
-        f"Jobs within {MAX_JOB_AGE_HOURS} hours: "
-        f"{len(recent)}"
+        f"Jobs within "
+        f"{MAX_JOB_AGE_HOURS} hours: "
+        f"{len(recent_jobs)}"
     )
 
     print(
         f"Jobs with unknown posting time: "
-        f"{len(unknown_timestamp)}"
+        f"{len(unknown_timestamp_jobs)}"
     )
 
-    # Keep unknown timestamp jobs available, but put them
-    # after known-recent jobs.
-    recent.extend(
-        unknown_timestamp
+    # Unknown timestamps are retained after known-recent
+    # jobs. Local filtering will decide whether they are
+    # actually relevant.
+    recent_jobs.extend(
+        unknown_timestamp_jobs
     )
 
-    return recent
+    return recent_jobs
 
 
-# ---------------------------------------------------------
-# DEDUPLICATION
-# ---------------------------------------------------------
+# ============================================================
+# CURRENT-RUN DEDUPLICATION
+# ============================================================
 
-def deduplicate_jobs(
-    jobs: list[dict],
-) -> list[dict]:
+def deduplicate_jobs(jobs):
     """
-    Remove duplicates inside the current Apify response.
+    Remove duplicate jobs within the current Apify response.
     """
 
     seen = set()
-    unique = []
+    unique_jobs = []
 
     for job in jobs:
         job_id = get_job_id(job)
@@ -1067,32 +559,42 @@ def deduplicate_jobs(
 
         job["_job_id"] = job_id
 
-        unique.append(job)
+        unique_jobs.append(job)
 
     print(
         f"Unique jobs in current run: "
-        f"{len(unique)}"
+        f"{len(unique_jobs)}"
     )
 
-    return unique
+    return unique_jobs
 
 
-# ---------------------------------------------------------
-# MATCHING
-# ---------------------------------------------------------
+# ============================================================
+# LOCAL + AI MATCHING
+# ============================================================
 
-def score_and_rank_jobs(
-    jobs: list[dict],
-) -> list[dict]:
+def score_and_rank_jobs(jobs):
     """
-    Local filter -> one Groq batch request -> ranking.
+    Matching pipeline:
+
+    1. Local deterministic filtering
+    2. Maximum 15 jobs sent to Groq
+    3. ONE Groq batch request
+    4. Local fallback if Groq fails
+    5. Sort by match score
+    6. Keep jobs >= MIN_MATCH_SCORE
     """
 
     if not jobs:
         print(
             "No jobs available for matching."
         )
+
         return []
+
+    # --------------------------------------------------------
+    # LOCAL FILTER
+    # --------------------------------------------------------
 
     print()
     print("=" * 70)
@@ -1105,19 +607,44 @@ def score_and_rank_jobs(
 
     if not candidates:
         print(
-            "No plausible AI/ML jobs survived "
-            "the local filter."
+            "No jobs survived the local AI/ML filter."
         )
+
         return []
+
+    print(
+        f"Local filter produced "
+        f"{len(candidates)} candidates."
+    )
+
+    # --------------------------------------------------------
+    # SINGLE GROQ BATCH REQUEST
+    # --------------------------------------------------------
 
     print()
     print("=" * 70)
     print("AI BATCH MATCHING")
     print("=" * 70)
 
+    print(
+        "Important: production path performs "
+        "ONE Groq request."
+    )
+
     scored_jobs = score_jobs_batch(
         candidates
     )
+
+    if not scored_jobs:
+        print(
+            "No scored jobs returned."
+        )
+
+        return []
+
+    # --------------------------------------------------------
+    # SORT
+    # --------------------------------------------------------
 
     scored_jobs.sort(
         key=lambda job: job.get(
@@ -1126,6 +653,10 @@ def score_and_rank_jobs(
         ),
         reverse=True,
     )
+
+    # --------------------------------------------------------
+    # THRESHOLD
+    # --------------------------------------------------------
 
     matched_jobs = [
         job
@@ -1138,9 +669,14 @@ def score_and_rank_jobs(
 
     print()
     print(
-        f"Jobs meeting {MIN_MATCH_SCORE}+ threshold: "
+        f"Jobs meeting "
+        f"{MIN_MATCH_SCORE}+ threshold: "
         f"{len(matched_jobs)}"
     )
+
+    # --------------------------------------------------------
+    # DISPLAY TOP RESULTS
+    # --------------------------------------------------------
 
     print()
     print("TOP MATCHES")
@@ -1153,21 +689,25 @@ def score_and_rank_jobs(
         print(
             f"{index}. "
             f"{job.get('match_score', 0)}/100 | "
-            f"{job.get('title', 'Unknown')} | "
-            f"{job.get('companyName', 'Unknown')}"
+            f"{job.get('title', 'Unknown title')} | "
+            f"{job.get('companyName', 'Unknown company')}"
         )
 
     return matched_jobs
 
 
-# ---------------------------------------------------------
+# ============================================================
 # EMAIL
-# ---------------------------------------------------------
+# ============================================================
 
 def send_email(
-    jobs: list[dict],
-    total_new_jobs: int,
-) -> None:
+    jobs,
+    total_new_jobs,
+):
+    """
+    Send the final job report through Gmail SMTP.
+    """
+
     username = os.environ[
         "GMAIL_USERNAME"
     ]
@@ -1183,7 +723,8 @@ def send_email(
 
     message["Subject"] = (
         f"AI Job Hunter - "
-        f"{len(jobs[:MAX_EMAIL_JOBS])} High-Match Jobs"
+        f"{len(jobs[:MAX_EMAIL_JOBS])} "
+        f"High-Match Jobs"
     )
 
     now = datetime.now(
@@ -1197,46 +738,62 @@ def send_email(
         "",
         f"Run time: {now}",
         f"New jobs discovered: {total_new_jobs}",
-        f"High-match jobs: "
-        f"{len(jobs[:MAX_EMAIL_JOBS])}",
+        (
+            "High-match jobs: "
+            f"{len(jobs[:MAX_EMAIL_JOBS])}"
+        ),
         "",
-        "Architecture:",
-        "- 1 Apify request",
+        "ARCHITECTURE:",
+        "- One Apify batch request",
         "- Local relevance filtering",
-        "- Maximum 1 Groq batch request",
+        "- Maximum one Groq batch request",
         "- Persistent seen-job cache",
+        "- Local fallback when Groq is unavailable",
         "",
-        "Freshness filter:",
-        f"Posted within the last "
-        f"{MAX_JOB_AGE_HOURS} hours",
-        f"AI match threshold: "
-        f"{MIN_MATCH_SCORE}/100",
+        (
+            "Freshness filter: "
+            f"Last {MAX_JOB_AGE_HOURS} hours"
+        ),
+        (
+            "AI match threshold: "
+            f"{MIN_MATCH_SCORE}/100"
+        ),
         "",
         "=" * 70,
         "",
     ]
+
+    # --------------------------------------------------------
+    # NO MATCHES
+    # --------------------------------------------------------
 
     if not jobs:
         lines.extend(
             [
                 "No new jobs met the AI match threshold.",
                 "",
-                "This does NOT necessarily mean there are "
-                "no relevant jobs.",
+                "This does NOT necessarily mean that "
+                "zero jobs were found.",
                 "",
                 "Possible reasons:",
                 "- No new jobs were discovered.",
-                "- Jobs were already seen in a previous run.",
+                "- Jobs were already seen in an earlier run.",
                 "- Jobs failed the local AI/ML filter.",
-                "- No jobs reached the match threshold.",
+                "- Jobs did not meet the match threshold.",
                 "",
-                "The system will continue searching "
-                "during the next run.",
+                (
+                    "The agent will search again during "
+                    "the next scheduled run."
+                ),
                 "",
                 "=" * 70,
                 "",
             ]
         )
+
+    # --------------------------------------------------------
+    # JOBS
+    # --------------------------------------------------------
 
     for index, job in enumerate(
         jobs[:MAX_EMAIL_JOBS],
@@ -1326,16 +883,26 @@ def send_email(
             [
                 f"{index}. {title}",
                 "",
-                f"AI MATCH SCORE: "
-                f"{match_score}/100",
-                f"Qualification: "
-                f"{qualification}",
-                f"Experience fit: "
-                f"{experience_fit}",
-                f"Technical fit: "
-                f"{technical_fit}/100",
-                f"Role fit: "
-                f"{role_fit}/100",
+                (
+                    f"AI MATCH SCORE: "
+                    f"{match_score}/100"
+                ),
+                (
+                    f"Qualification: "
+                    f"{qualification}"
+                ),
+                (
+                    f"Experience fit: "
+                    f"{experience_fit}"
+                ),
+                (
+                    f"Technical fit: "
+                    f"{technical_fit}/100"
+                ),
+                (
+                    f"Role fit: "
+                    f"{role_fit}/100"
+                ),
                 "",
                 f"Company: {company}",
                 f"Location: {location}",
@@ -1350,6 +917,10 @@ def send_email(
             ]
         )
 
+        # ----------------------------------------------------
+        # KEY MATCHES
+        # ----------------------------------------------------
+
         if key_matches:
             lines.append(
                 "KEY MATCHES:"
@@ -1362,6 +933,10 @@ def send_email(
 
             lines.append("")
 
+        # ----------------------------------------------------
+        # MISSING REQUIREMENTS
+        # ----------------------------------------------------
+
         if missing_requirements:
             lines.append(
                 "MISSING REQUIREMENTS:"
@@ -1373,6 +948,10 @@ def send_email(
                 )
 
             lines.append("")
+
+        # ----------------------------------------------------
+        # CONCERNS
+        # ----------------------------------------------------
 
         if concerns:
             lines.append(
@@ -1393,52 +972,131 @@ def send_email(
             ]
         )
 
+    # --------------------------------------------------------
+    # SEND
+    # --------------------------------------------------------
+
     message.set_content(
         "\n".join(lines)
     )
 
+    print()
     print(
         "Connecting to Gmail..."
     )
 
-    with smtplib.SMTP_SSL(
-        "smtp.gmail.com",
-        465,
-    ) as server:
-        server.login(
-            username,
-            app_password,
+    try:
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com",
+            465,
+        ) as server:
+
+            server.login(
+                username,
+                app_password,
+            )
+
+            server.send_message(
+                message
+            )
+
+    except Exception as error:
+        print(
+            f"Gmail send failed: {error}"
         )
 
-        server.send_message(
-            message
-        )
+        raise
+
+    print(
+        "Email sent successfully."
+    )
 
 
-# ---------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
 
 def main():
+    """
+    Main AI Job Hunter pipeline.
+
+    Architecture:
+
+        Apify
+          |
+          | ONE API CALL
+          v
+        Raw jobs
+          |
+          v
+        Freshness filter
+          |
+          v
+        Current-run deduplication
+          |
+          v
+        Persistent seen-job filtering
+          |
+          v
+        Local AI/ML filtering
+          |
+          v
+        Maximum 15 candidates
+          |
+          | ONE GROQ API CALL
+          v
+        AI batch scoring
+          |
+          v
+        Match threshold
+          |
+          v
+        Gmail report
+    """
+
     print("=" * 70)
     print("AI JOB HUNTER STARTED")
     print("=" * 70)
 
+    print()
+    print(
+        "API strategy:"
+    )
+    print(
+        "  Apify: 1 request"
+    )
+    print(
+        "  Groq: maximum 1 request"
+    )
+    print(
+        "  Local processing: unlimited"
+    )
+
+    # ========================================================
+    # 1. LOAD STATE
+    # ========================================================
+
     state = load_state()
 
-    # -----------------------------------------------------
-    # 1. ONE APIFY CALL
-    # -----------------------------------------------------
+    print(
+        f"Previously tracked jobs: "
+        f"{len(state.get('jobs', {}))}"
+    )
+
+    # ========================================================
+    # 2. SEARCH APIFY
+    # ========================================================
 
     jobs = search_jobs()
 
     if not jobs:
+        print()
         print(
-            "No jobs returned from Apify."
+            "No jobs were returned by Apify."
         )
 
-        # Still send a diagnostic email rather than
-        # silently claiming that zero jobs exist.
+        # Send a diagnostic email instead of pretending
+        # the job search successfully found zero jobs.
         send_email(
             jobs=[],
             total_new_jobs=0,
@@ -1446,90 +1104,87 @@ def main():
 
         save_state(state)
 
+        print(
+            "AI JOB HUNTER FINISHED"
+        )
+
         return
 
-    # -----------------------------------------------------
-    # 2. LOCAL FRESHNESS FILTER
-    # -----------------------------------------------------
+    # ========================================================
+    # 3. FRESHNESS FILTER
+    # ========================================================
 
     recent_jobs = filter_recent_jobs(
         jobs
     )
 
-    # -----------------------------------------------------
-    # 3. LOCAL DEDUPLICATION
-    # -----------------------------------------------------
+    # ========================================================
+    # 4. CURRENT-RUN DEDUPLICATION
+    # ========================================================
 
     unique_jobs = deduplicate_jobs(
         recent_jobs
     )
 
-    # -----------------------------------------------------
-    # 4. PERSISTENT DEDUPLICATION
-    # -----------------------------------------------------
+    # ========================================================
+    # 5. PERSISTENT DEDUPLICATION
+    # ========================================================
 
     new_jobs = remove_previously_seen_jobs(
         unique_jobs,
         state,
     )
 
+    # Save immediately so discovered jobs are recorded
+    # even if later processing fails.
     save_state(state)
 
-    # -----------------------------------------------------
-    # 5. LOCAL AI/ML FILTER
-    # -----------------------------------------------------
+    # ========================================================
+    # 6. MATCH
+    # ========================================================
 
     matched_jobs = score_and_rank_jobs(
         new_jobs
     )
 
-    # -----------------------------------------------------
-    # 6. EMAIL
-    # -----------------------------------------------------
+    # ========================================================
+    # 7. EMAIL
+    # ========================================================
 
     print()
+    print("=" * 70)
+    print("EMAIL REPORT")
+    print("=" * 70)
+
     print(
-        f"Sending "
-        f"{len(matched_jobs[:MAX_EMAIL_JOBS])} "
-        f"high-match jobs..."
+        f"New jobs: {len(new_jobs)}"
+    )
+
+    print(
+        f"High-match jobs: "
+        f"{len(matched_jobs[:MAX_EMAIL_JOBS])}"
     )
 
     send_email(
-        matched_jobs,
+        jobs=matched_jobs,
         total_new_jobs=len(new_jobs),
     )
 
-    print(
-        "Email sent successfully."
-    )
+    # ========================================================
+    # 8. SAVE STATE AGAIN
+    # ========================================================
 
-    print("=" * 70)
-    print(
-        "AI JOB HUNTER COMPLETED"
-    )
-    print("=" * 70)
-
-
-if __name__ == "__main__":
-    main()
+    save_state(state)
 
     print()
-    print(
-        f"Sending "
-        f"{len(matched_jobs[:MAX_EMAIL_JOBS])} "
-        f"high-match jobs..."
-    )
-
-    send_email(
-        matched_jobs
-    )
-
-    print(
-        "Email sent successfully."
-    )
-
+    print("=" * 70)
+    print("AI JOB HUNTER COMPLETED")
     print("=" * 70)
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
