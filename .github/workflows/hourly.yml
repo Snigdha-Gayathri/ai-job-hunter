@@ -21,6 +21,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Persistent state prevents the same jobs from being
+      # processed repeatedly across hourly workflow runs.
+      - name: Restore job hunter state
+        uses: actions/cache@v4
+        with:
+          path: agent/state
+          key: job-hunter-state-${{ github.run_id }}
+          restore-keys: |
+            job-hunter-state-
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -35,3 +45,10 @@ jobs:
         run: |
           cd agent
           python main.py
+
+      # Save the updated seen-job database for the next hourly run.
+      - name: Save job hunter state
+        uses: actions/cache/save@v4
+        with:
+          path: agent/state
+          key: job-hunter-state-${{ github.run_id }}
