@@ -245,8 +245,8 @@ def search_jobs():
     """
     Make exactly ONE Apify API request.
 
-    Apify returns a batch of jobs which are then processed
-    locally.
+    Apify may return HTTP 200 or HTTP 201 when the
+    synchronous actor execution succeeds.
     """
 
     params = {
@@ -272,9 +272,7 @@ def search_jobs():
     print("APIFY JOB SEARCH")
     print("=" * 70)
 
-    print(
-        "Sending ONE request to Apify..."
-    )
+    print("Sending ONE request to Apify...")
 
     try:
         response = requests.post(
@@ -288,7 +286,6 @@ def search_jobs():
         print(
             f"Apify request failed: {error}"
         )
-
         return []
 
     print(
@@ -296,30 +293,36 @@ def search_jobs():
         f"{response.status_code}"
     )
 
-    if response.status_code == 429:
-        print(
-            "Apify rate limit reached."
-        )
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # Apify can return 200 OR 201 for a successful
+    # run-sync-get-dataset-items request.
+    # --------------------------------------------------------
 
-        retry_after = response.headers.get(
-            "Retry-After"
-        )
-
-        if retry_after:
+    if response.status_code not in (200, 201):
+        if response.status_code == 429:
             print(
-                f"Apify requested retry after "
-                f"{retry_after} seconds."
+                "Apify rate limit reached."
             )
 
-        print(
-            "No retry will be performed during this run."
-        )
+            retry_after = response.headers.get(
+                "Retry-After"
+            )
 
-        return []
+            if retry_after:
+                print(
+                    f"Apify requested retry after "
+                    f"{retry_after} seconds."
+                )
 
-    if response.status_code != 200:
+            print(
+                "No retry will be performed during this run."
+            )
+
+            return []
+
         print(
-            "Apify returned an error:"
+            "Apify returned an actual HTTP error:"
         )
 
         print(
@@ -327,6 +330,10 @@ def search_jobs():
         )
 
         return []
+
+    # --------------------------------------------------------
+    # SUCCESS
+    # --------------------------------------------------------
 
     try:
         data = response.json()
@@ -342,22 +349,49 @@ def search_jobs():
 
         return []
 
-    if not isinstance(data, list):
+    # The successful response is a list of scraped jobs.
+    if isinstance(data, list):
         print(
-            "Unexpected Apify response format."
+            f"Apify returned {len(data)} jobs."
         )
 
+        return data
+
+    # Defensive handling in case Apify returns an object.
+    if isinstance(data, dict):
         print(
-            type(data).__name__
+            "Apify returned a JSON object instead of "
+            "a job list."
         )
 
-        return []
+        # Some Apify responses may wrap dataset items.
+        for key in (
+            "items",
+            "data",
+            "results",
+        ):
+            if isinstance(
+                data.get(key),
+                list,
+            ):
+                jobs = data[key]
+
+                print(
+                    f"Apify returned "
+                    f"{len(jobs)} jobs."
+                )
+
+                return jobs
 
     print(
-        f"Apify returned {len(data)} jobs."
+        "Unexpected Apify response format."
     )
 
-    return data
+    print(
+        str(data)[:3000]
+    )
+
+    return []
 
 
 # ============================================================
