@@ -1,0 +1,85 @@
+name: Hourly AI Recruiter Hunter
+
+on:
+  schedule:
+    - cron: "15 * * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-recruiter-hunter
+  cancel-in-progress: false
+
+jobs:
+  recruiter-hunt:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ------------------------------------------------------
+      # CHECKOUT
+      # ------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------
+      # PYTHON
+      # ------------------------------------------------------
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ------------------------------------------------------
+      # RESTORE PERSISTENT STATE
+      # ------------------------------------------------------
+
+      - name: Restore recruiter state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: recruiter-state-${{ github.run_id }}
+          restore-keys: |
+            recruiter-state-
+
+      # ------------------------------------------------------
+      # DEPENDENCIES
+      # ------------------------------------------------------
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      # ------------------------------------------------------
+      # RUN
+      # ------------------------------------------------------
+
+      - name: Run AI Recruiter Hunter
+        env:
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+
+          GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
+
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+
+          VIDEO_RESUME_URL: ${{ secrets.VIDEO_RESUME_URL }}
+
+          AUTO_SEND: "false"
+
+        run: |
+          python agent/recruiter_main.py
+
+      # ------------------------------------------------------
+      # SAVE STATE
+      # ------------------------------------------------------
+
+      - name: Save recruiter state
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: recruiter-state-${{ github.run_id }}
