@@ -762,92 +762,95 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
     # --------------------------------------------------------
     # PAUSE & LIVE RUN 2 (COMPARISON TEST)
     # --------------------------------------------------------
-    sleep_seconds = int(os.environ.get("APIFY_COMPARE_DELAY_SECONDS", "120"))
-    print()
-    print("=" * 80)
-    print(f"PAUSING {sleep_seconds} SECONDS BEFORE RUN 2 (LIVE REPEATABILITY TEST)")
-    print("=" * 80)
-    print(f"Sleeping {sleep_seconds}s to observe live change in LinkedIn results...")
-    time.sleep(sleep_seconds)
+    enable_compare = os.environ.get("APIFY_COMPARE_RUNS", "false").lower() == "true"
+    if enable_compare:
+        sleep_seconds = int(os.environ.get("APIFY_COMPARE_DELAY_SECONDS", "120"))
+        print()
+        print("=" * 80)
+        print(f"PAUSING {sleep_seconds} SECONDS BEFORE RUN 2 (LIVE REPEATABILITY TEST)")
+        print("=" * 80)
+        print(f"Sleeping {sleep_seconds}s to observe live change in LinkedIn results...")
+        time.sleep(sleep_seconds)
 
-    jobs_2, meta_2 = execute_apify_run(payload, params, "Run 2", run_metadata)
-    summary_2 = inspect_and_log_jobs(
-        jobs_2,
-        datetime.now(timezone.utc),
-        "Run 2",
-    )
+        jobs_2, meta_2 = execute_apify_run(payload, params, "Run 2", run_metadata)
+        summary_2 = inspect_and_log_jobs(
+            jobs_2,
+            datetime.now(timezone.utc),
+            "Run 2",
+        )
 
-    # --------------------------------------------------------
-    # COMPARISON & EMPIRICAL EVIDENCE EVALUATION
-    # --------------------------------------------------------
-    ids_1 = set(summary_1["job_ids"])
-    ids_2 = set(summary_2["job_ids"])
-    common_ids = ids_1 & ids_2
-    new_in_run2 = ids_2 - ids_1
-    dropped_in_run2 = ids_1 - ids_2
+        # --------------------------------------------------------
+        # COMPARISON & EMPIRICAL EVIDENCE EVALUATION
+        # --------------------------------------------------------
+        ids_1 = set(summary_1["job_ids"])
+        ids_2 = set(summary_2["job_ids"])
+        common_ids = ids_1 & ids_2
+        new_in_run2 = ids_2 - ids_1
+        dropped_in_run2 = ids_1 - ids_2
 
-    overlap_pct = round((len(common_ids) / max(len(ids_1), 1)) * 100, 1)
+        overlap_pct = round((len(common_ids) / max(len(ids_1), 1)) * 100, 1)
 
-    print()
-    print("=" * 80)
-    print("APIFY ACQUISITION LAYER - EMPIRICAL COMPARISON REPORT")
-    print("=" * 80)
-    print(f"1. Run Identifiers & Fresh Invocation Proof:")
-    print(f"   Run 1 Actor ID: {meta_1.get('actor_run_id')} (Duration: {meta_1.get('duration_seconds')}s)")
-    print(f"   Run 2 Actor ID: {meta_2.get('actor_run_id')} (Duration: {meta_2.get('duration_seconds')}s)")
-    is_fresh_actor = (
-        meta_1.get("actor_run_id") != "Not reported in header"
-        and meta_1.get("actor_run_id") != meta_2.get("actor_run_id")
-    )
-    print(f"   Fresh Actor Spawning Detected: {is_fresh_actor}")
+        print()
+        print("=" * 80)
+        print("APIFY ACQUISITION LAYER - EMPIRICAL COMPARISON REPORT")
+        print("=" * 80)
+        print("1. Run Identifiers & Fresh Invocation Proof:")
+        print(f"   Run 1 Actor ID: {meta_1.get('actor_run_id')} (Duration: {meta_1.get('duration_seconds')}s)")
+        print(f"   Run 2 Actor ID: {meta_2.get('actor_run_id')} (Duration: {meta_2.get('duration_seconds')}s)")
+        is_fresh_actor = (
+            meta_1.get("actor_run_id") != "Not reported in header"
+            and meta_1.get("actor_run_id") != meta_2.get("actor_run_id")
+        )
+        print(f"   Fresh Actor Spawning Detected: {is_fresh_actor}")
 
-    print()
-    print(f"2. Job Set Overlap Across Repeated Runs ({sleep_seconds}s apart):")
-    print(f"   Jobs in Run 1:                  {len(ids_1)}")
-    print(f"   Jobs in Run 2:                  {len(ids_2)}")
-    print(f"   Identical Jobs in Both Runs:    {len(common_ids)} ({overlap_pct}%)")
-    print(f"   Newly Appeared in Run 2:        {len(new_in_run2)}")
-    print(f"   Dropped in Run 2:               {len(dropped_in_run2)}")
+        print()
+        print(f"2. Job Set Overlap Across Repeated Runs ({sleep_seconds}s apart):")
+        print(f"   Jobs in Run 1:                  {len(ids_1)}")
+        print(f"   Jobs in Run 2:                  {len(ids_2)}")
+        print(f"   Identical Jobs in Both Runs:    {len(common_ids)} ({overlap_pct}%)")
+        print(f"   Newly Appeared in Run 2:        {len(new_in_run2)}")
+        print(f"   Dropped in Run 2:               {len(dropped_in_run2)}")
 
-    print()
-    print(f"3. Posting Age & Freshness Distribution:")
-    print(f"   Run 1 Youngest Job Age:         {summary_1['youngest_latency_min']} minutes")
-    print(f"   Run 2 Youngest Job Age:         {summary_2['youngest_latency_min']} minutes")
-    print(f"   Run 1 Jobs <= 60m:              {summary_1['jobs_within_60m']}")
-    print(f"   Run 2 Jobs <= 60m:              {summary_2['jobs_within_60m']}")
-    print(f"   Run 1 Jobs <= 90m:              {summary_1['jobs_within_90m']}")
-    print(f"   Run 2 Jobs <= 90m:              {summary_2['jobs_within_90m']}")
+        print()
+        print("3. Posting Age & Freshness Distribution:")
+        print(f"   Run 1 Youngest Job Age:         {summary_1['youngest_latency_min']} minutes")
+        print(f"   Run 2 Youngest Job Age:         {summary_2['youngest_latency_min']} minutes")
+        print(f"   Run 1 Jobs <= 60m:              {summary_1['jobs_within_60m']}")
+        print(f"   Run 2 Jobs <= 60m:              {summary_2['jobs_within_60m']}")
+        print(f"   Run 1 Jobs <= 90m:              {summary_1['jobs_within_90m']}")
+        print(f"   Run 2 Jobs <= 90m:              {summary_2['jobs_within_90m']}")
 
-    print()
-    print("=" * 80)
-    print("EVALUATION OF ACCEPTANCE CRITERIA (9:47 -> 10:00 POSTING DISCOVERY):")
-    print("=" * 80)
-    has_sub_60m_jobs = (summary_1["jobs_within_60m"] > 0) or (summary_2["jobs_within_60m"] > 0)
-    youngest_overall = min(
-        x for x in [summary_1["youngest_latency_min"], summary_2["youngest_latency_min"]]
-        if x is not None
-    ) if (summary_1["youngest_latency_min"] is not None or summary_2["youngest_latency_min"] is not None) else None
+        print()
+        print("=" * 80)
+        print("EVALUATION OF ACCEPTANCE CRITERIA (9:47 -> 10:00 POSTING DISCOVERY):")
+        print("=" * 80)
+        has_sub_60m_jobs = (summary_1["jobs_within_60m"] > 0) or (summary_2["jobs_within_60m"] > 0)
+        youngest_overall = min(
+            x for x in [summary_1["youngest_latency_min"], summary_2["youngest_latency_min"]]
+            if x is not None
+        ) if (summary_1["youngest_latency_min"] is not None or summary_2["youngest_latency_min"] is not None) else None
 
-    if has_sub_60m_jobs:
-        print(f"POSITIVE EVIDENCE: Scraper successfully acquired jobs posted < 60m ago.")
-        print(f"Youngest job discovered was posted {youngest_overall} minutes ago.")
-    else:
-        print(f"CRITICAL FINDING: Neither run returned any jobs posted within the preceding 60 minutes.")
-        print(f"Youngest job observed across both runs: {youngest_overall} minutes ago.")
+        if has_sub_60m_jobs:
+            print(f"POSITIVE EVIDENCE: Scraper successfully acquired jobs posted < 60m ago.")
+            print(f"Youngest job discovered was posted {youngest_overall} minutes ago.")
+        else:
+            print("CRITICAL FINDING: Neither run returned any jobs posted within the preceding 60 minutes.")
+            print(f"Youngest job observed across both runs: {youngest_overall} minutes ago.")
 
-    # Combine unique jobs from both runs for downstream processing
-    seen_unique_ids = set()
-    combined_jobs = []
-    for j in (jobs_1 + jobs_2):
-        jid = extract_linkedin_job_id(j) or get_job_id(j)
-        if jid not in seen_unique_ids:
-            seen_unique_ids.add(jid)
-            combined_jobs.append(j)
+        # Combine unique jobs from both runs for downstream processing
+        seen_unique_ids = set()
+        combined_jobs = []
+        for j in (jobs_1 + jobs_2):
+            jid = extract_linkedin_job_id(j) or get_job_id(j)
+            if jid not in seen_unique_ids:
+                seen_unique_ids.add(jid)
+                combined_jobs.append(j)
 
-    print(f"Total Unique Jobs Prepared for Pipeline: {len(combined_jobs)}")
-    print("=" * 80)
+        print(f"Total Unique Jobs Prepared for Pipeline: {len(combined_jobs)}")
+        print("=" * 80)
+        return combined_jobs
 
-    return combined_jobs
+    return jobs_1
 
 
 def search_jobs(run_metadata: dict) -> list[dict]:
