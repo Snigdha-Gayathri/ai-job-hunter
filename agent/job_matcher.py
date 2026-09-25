@@ -392,7 +392,8 @@ def build_batch_prompt(jobs: list[dict]) -> str:
             or ""
         )
 
-        description = str(description)[:10000]
+        # Keep descriptions concise to prevent Groq 413 Payload Too Large
+        description = str(description)[:1500]
 
         job_blocks.append(
             f"""
