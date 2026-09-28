@@ -2,9 +2,9 @@ name: Hourly AI Job Hunter
 
 on:
   schedule:
-    # Runs at minute 30 of every hour UTC, which corresponds to minute 00 of every hour in India Standard Time (IST, UTC+5:30)
-    # E.g., 03:30 UTC = 09:00 IST, 04:30 UTC = 10:00 IST, 05:30 UTC = 11:00 IST.
-    - cron: "30 * * * *"
+    # Runs every 15 minutes to dramatically reduce job detection latency
+    # while staying well within GitHub Actions fair use guidelines.
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -34,14 +34,14 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: agent/state
-          key: job-hunter-state-${{ github.run_id }}
+          key: job-hunter-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             job-hunter-state-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install -r requirements.txt
 
       - name: Run AI Job Hunter
         env:
@@ -54,10 +54,11 @@ jobs:
           cd agent
           python main.py
 
-      # Save the updated seen-job database for the next hourly run.
+      # Save the updated seen-job database for the next run.
+      # Only saves on success so a failed run cannot corrupt the persistent state cache.
       - name: Save job hunter state
         uses: actions/cache/save@v4
-        if: always()
+        if: success()
         with:
           path: agent/state
-          key: job-hunter-state-${{ github.run_id }}
+          key: job-hunter-state-${{ github.run_id }}-${{ github.run_attempt }}

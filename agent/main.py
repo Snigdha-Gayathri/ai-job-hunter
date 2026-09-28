@@ -7,12 +7,23 @@ from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
+import sys
 import requests
 
 from job_matcher import (
     locally_filter_jobs,
     score_jobs_batch,
+    classify_priority,
 )
+from sources import (
+    SourceRegistry,
+    normalize_url,
+)
+from config import (
+    SOURCES_CONFIG,
+    HIGH_PRIORITY_SCORE,
+)
+
 
 
 # ============================================================
@@ -106,6 +117,7 @@ def load_state() -> dict:
     if not STATE_FILE.exists():
         return {
             "jobs": {},
+            "sources": {},
             "last_run": {},
         }
 
@@ -114,10 +126,13 @@ def load_state() -> dict:
             state = json.load(file)
 
         if not isinstance(state, dict):
-            return {"jobs": {}, "last_run": {}}
+            return {"jobs": {}, "sources": {}, "last_run": {}}
 
         if "jobs" not in state or not isinstance(state["jobs"], dict):
             state["jobs"] = {}
+
+        if "sources" not in state or not isinstance(state["sources"], dict):
+            state["sources"] = {}
 
         if "last_run" not in state or not isinstance(state["last_run"], dict):
             state["last_run"] = {}
@@ -126,7 +141,7 @@ def load_state() -> dict:
 
     except Exception as error:
         print(f"WARNING: Could not load state file: {error}")
-        return {"jobs": {}, "last_run": {}}
+        return {"jobs": {}, "sources": {}, "last_run": {}}
 
 
 def save_state(state: dict):
@@ -147,12 +162,16 @@ def save_state(state: dict):
         state["jobs"] = dict(sorted_items[:MAX_SEEN_JOBS])
 
     try:
-        with STATE_FILE.open("w", encoding="utf-8") as file:
+        temp_file = STATE_FILE.with_suffix(".tmp")
+        with temp_file.open("w", encoding="utf-8") as file:
             json.dump(state, file, indent=2)
+        temp_file.replace(STATE_FILE)
 
         if "last_run" in state and state["last_run"]:
-            with METRICS_FILE.open("w", encoding="utf-8") as file:
+            metrics_temp = METRICS_FILE.with_suffix(".tmp")
+            with metrics_temp.open("w", encoding="utf-8") as file:
                 json.dump(state["last_run"], file, indent=2)
+            metrics_temp.replace(METRICS_FILE)
 
         print(
             f"State saved: {len(state['jobs'])} jobs tracked."
@@ -194,21 +213,31 @@ def extract_linkedin_job_id(job: dict) -> str | None:
     return None
 
 
+def normalize_string_key(s: str) -> str:
+    """Strip punctuation and whitespace for fuzzy cross-source matching."""
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
 def get_job_id(job: dict) -> str:
     """
     Generate a stable, unique identifier for a job.
     Preference:
-    1. LinkedIn numeric Job ID
-    2. Canonical URL
-    3. Normalized title|company|location
+    1. LinkedIn numeric Job ID (exact backward compatibility)
+    2. Explicit source_job_id (ATS/job boards)
+    3. Canonical URL
+    4. Normalized title|company|location
     """
     lid = extract_linkedin_job_id(job)
     if lid:
         return lid
 
+    source_job_id = job.get("source_job_id")
+    if source_job_id:
+        return str(source_job_id).strip()
+
     raw_url = str(job.get("jobUrl") or job.get("url") or "").strip()
     if raw_url:
-        clean_url = raw_url.split("?")[0].rstrip("/")
+        clean_url = normalize_url(raw_url)
         if clean_url:
             return clean_url
 
@@ -223,7 +252,7 @@ def get_job_id(job: dict) -> str:
 
 def get_canonical_job_url(job: dict, job_id: str) -> str:
     """
-    Return clean canonical LinkedIn URL without tracking tokens.
+    Return clean canonical URL without tracking tokens.
     """
     if job_id and job_id.isdigit():
         return f"https://www.linkedin.com/jobs/view/{job_id}"
@@ -232,11 +261,53 @@ def get_canonical_job_url(job: dict, job_id: str) -> str:
         job.get("jobUrl")
         or job.get("url")
         or job.get("applyUrl")
+        or job.get("apply_url")
         or ""
     )
-    if raw_url and "?" in raw_url:
-        return raw_url.split("?")[0]
-    return raw_url or "No URL available"
+    if raw_url:
+        return normalize_url(raw_url)
+    return "No URL available"
+
+
+def find_existing_job(job: dict, seen_jobs: dict) -> tuple[str | None, dict | None]:
+    """
+    Cross-source deduplication search with conservative identity evidence.
+    Avoids false merges across genuinely different job openings at the same company:
+    1. Direct job_id match
+    2. Canonical URL match (normalized without tracking params)
+    3. Direct application URL match (e.g. LinkedIn/aggregator applyUrl points to ATS board URL)
+    4. Explicit ATS / source job identifier match
+    """
+    job_id = job.get("_job_id") or get_job_id(job)
+    if job_id in seen_jobs:
+        return job_id, seen_jobs[job_id]
+
+    target_url = job.get("_canonical_url") or get_canonical_job_url(job, job_id)
+    target_apply_url = normalize_url(job.get("apply_url") or job.get("applyUrl") or "")
+    target_source_id = str(job.get("source_job_id") or "").strip()
+
+    for existing_id, record in seen_jobs.items():
+        rec_url = record.get("url", "")
+        rec_apply_url = normalize_url(record.get("apply_url") or record.get("applyUrl") or "")
+        rec_source_id = str(record.get("source_job_id") or "").strip()
+
+        # 1. Canonical URL match
+        if target_url and rec_url and target_url == rec_url:
+            return existing_id, record
+
+        # 2. Application endpoint cross-reference match
+        if target_url and rec_apply_url and target_url == rec_apply_url:
+            return existing_id, record
+        if target_apply_url and rec_url and target_apply_url == rec_url:
+            return existing_id, record
+        if target_apply_url and rec_apply_url and target_apply_url == rec_apply_url:
+            return existing_id, record
+
+        # 3. Explicit stable source identifier match (e.g. gh_999 or rok_123)
+        if target_source_id and rec_source_id and target_source_id == rec_source_id:
+            return existing_id, record
+
+    return None, None
 
 
 # ============================================================
@@ -342,9 +413,29 @@ def calculate_freshness(
     Formula:
       discovery_latency = scraper_discovered_at - linkedin_posted_at
     """
-    posted_at = parse_posted_time(job, reference_time=discovered_at)
+    posted_at = job.get("source_posted_at")
+    if posted_at is None:
+        posted_at = parse_posted_time(job, reference_time=discovered_at)
 
     if posted_at is None:
+        raw_posted = str(
+            job.get("postedAt")
+            or job.get("postedDate")
+            or job.get("postedAtText")
+            or job.get("date")
+            or ""
+        ).strip()
+        # If source has no date field at all and is not LinkedIn, treat as fresh on initial discovery
+        if not raw_posted and job.get("source") and job.get("source") != "linkedin":
+            return {
+                "posted_at": None,
+                "posted_at_iso": None,
+                "discovered_at_iso": discovered_at.isoformat(),
+                "discovery_latency_minutes": None,
+                "latency_formatted": "Newly discovered (no timestamp)",
+                "is_fresh": True,
+                "freshness_reason": "Freshly acquired from source without explicit posting timestamp.",
+            }
         return {
             "posted_at": None,
             "posted_at_iso": None,
@@ -853,27 +944,73 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
     return jobs_1
 
 
-def search_jobs(run_metadata: dict) -> list[dict]:
+source_registry = SourceRegistry()
+
+
+def search_jobs(
+    run_metadata: dict,
+    state: dict | None = None,
+    force_all: bool = False,
+) -> list[dict]:
     """
-    Dispatches to Apify (or Bright Data if explicitly chosen).
-    Tags all retrieved items with discovery metadata.
+    Multi-source acquisition dispatcher:
+    1. Dispatches to LinkedIn Apify (or Bright Data if chosen).
+    2. Dispatches to all due remote boards and ATS sources from SourceRegistry.
+    3. Failure in any single source is isolated so it never crashes the pipeline.
+    Tags all retrieved items with canonical discovery metadata.
     """
     discovered_at = datetime.now(timezone.utc)
-    provider_pref = os.environ.get("SCRAPER_PROVIDER", "apify").lower()
-
-    if provider_pref == "bright_data" and BRIGHT_DATA_API_KEY:
-        run_metadata["scraper_provider"] = "bright_data"
-        raw_jobs = search_jobs_brightdata(run_metadata)
-    else:
-        run_metadata["scraper_provider"] = "apify"
-        raw_jobs = search_jobs_apify(run_metadata)
-
+    source_states = state.setdefault("sources", {}) if state is not None else {}
     tagged_jobs = []
-    for item in raw_jobs:
-        if isinstance(item, dict):
-            item["_scraper_discovered_at"] = discovered_at
-            item["_source_provider"] = run_metadata["scraper_provider"]
-            tagged_jobs.append(item)
+
+    # 1. Existing LinkedIn Scraper
+    linkedin_due = force_all or (
+        source_states.get("linkedin", {}).get("last_polled") is None
+        or (discovered_at - datetime.fromisoformat(source_states["linkedin"]["last_polled"])).total_seconds() >= 25 * 60
+    )
+
+    if linkedin_due:
+        source_states.setdefault("linkedin", {})["last_polled"] = discovered_at.isoformat()
+        provider_pref = os.environ.get("SCRAPER_PROVIDER", "apify").lower()
+
+        if provider_pref == "bright_data" and BRIGHT_DATA_API_KEY:
+            run_metadata["scraper_provider"] = "bright_data"
+            raw_jobs = search_jobs_brightdata(run_metadata)
+        else:
+            run_metadata["scraper_provider"] = "apify"
+            raw_jobs = search_jobs_apify(run_metadata)
+
+        for item in raw_jobs:
+            if isinstance(item, dict):
+                item["_scraper_discovered_at"] = discovered_at
+                item["_source_provider"] = run_metadata["scraper_provider"]
+                item.setdefault("source", "linkedin")
+                tagged_jobs.append(item)
+
+        source_states["linkedin"]["last_success"] = discovered_at.isoformat()
+        source_states["linkedin"]["consecutive_failures"] = 0
+
+    # 2. Multi-source acquisition via SourceRegistry
+    due_sources = source_registry.get_due_sources(discovered_at, source_states, force_all=force_all)
+    if due_sources:
+        print()
+        print("=" * 70)
+        print(f"MULTI-SOURCE ACQUISITION ({len(due_sources)} due sources)")
+        print("=" * 70)
+
+        for src in due_sources:
+            try:
+                print(f"Fetching from {src.name} ({src.config.get('acquisition_method')})...")
+                src_jobs = source_registry.fetch_source_jobs(src, discovered_at, source_states)
+                print(f"  [{src.name}] Fetched {len(src_jobs)} jobs.")
+                for item in src_jobs:
+                    item["_scraper_discovered_at"] = discovered_at
+                    item["_source_provider"] = src.source_id
+                    tagged_jobs.append(item)
+            except Exception as error:
+                err_msg = f"[{src.name}] Acquisition error: {error}"
+                print(f"ERROR: {err_msg}")
+                run_metadata["scraper_errors"].append(err_msg)
 
     run_metadata["jobs_retrieved"] = len(tagged_jobs)
     return tagged_jobs
@@ -898,6 +1035,7 @@ def process_jobs_freshness_and_state(
     3. Previously seen but not successfully emailed (status == 'discovered'): RETRY ELIGIBLE!
     4. Newly discovered job: Calculate freshness and process
     5. Stale job: Record as stale, DO NOT email
+    6. Multi-source deduplication: Collapses same job across multiple sources
     """
     seen_jobs = state.setdefault("jobs", {})
     eligible_jobs = []
@@ -919,6 +1057,8 @@ def process_jobs_freshness_and_state(
         job["_job_id"] = job_id
         canonical_url = get_canonical_job_url(job, job_id)
         job["_canonical_url"] = canonical_url
+        source_name = job.get("source") or job.get("_source_provider") or "linkedin"
+        job["source"] = source_name
 
         # Prevent duplicate items within the same scrape response
         if job_id in current_run_seen_ids:
@@ -932,23 +1072,44 @@ def process_jobs_freshness_and_state(
         job["_discovery_latency_minutes"] = freshness["discovery_latency_minutes"]
         job["_latency_formatted"] = freshness["latency_formatted"]
 
-        existing_record = seen_jobs.get(job_id)
+        # 2. Cross-Source Deduplication Check
+        existing_id, existing_record = find_existing_job(job, seen_jobs)
+        if existing_id:
+            job_id = existing_id
+            job["_job_id"] = existing_id
 
-        # 2. Check if already successfully emailed
-        if (
-            existing_record
-            and existing_record.get("status") == "emailed"
+        # If already finalized (emailed, rejected, stale, email_abandoned): skip!
+        if existing_record and existing_record.get("status") in (
+            "emailed",
+            "rejected",
+            "stale",
+            "email_abandoned",
         ):
             run_metadata["duplicates_skipped"] += 1
             existing_record["last_seen"] = discovered_at.isoformat()
+            seen_sources = existing_record.setdefault("seen_sources", [existing_record.get("source", "linkedin")])
+            if source_name not in seen_sources:
+                seen_sources.append(source_name)
             continue
+
+        # Check retry limit for failed email attempts (max 3 retries)
+        if existing_record and existing_record.get("status") == "email_failed":
+            attempts = existing_record.get("email_attempts", 0)
+            if attempts >= 3:
+                existing_record["status"] = "email_abandoned"
+                run_metadata["duplicates_skipped"] += 1
+                print(
+                    f"[RETRY ABANDONED] Max email attempts (3) exceeded for "
+                    f"'{job.get('title')}' at '{job.get('companyName') or job.get('company')}'"
+                )
+                continue
 
         # 3. Check for stale jobs
         if not freshness["is_fresh"]:
             run_metadata["stale_jobs_filtered"] += 1
             print(
                 f"[STALE FILTERED] '{job.get('title')}' at "
-                f"'{job.get('companyName')}' - "
+                f"'{job.get('companyName') or job.get('company')}' - "
                 f"{freshness['freshness_reason']}"
             )
 
@@ -956,16 +1117,25 @@ def process_jobs_freshness_and_state(
             if job_id not in seen_jobs:
                 seen_jobs[job_id] = {
                     "job_id": job_id,
+                    "source_job_id": job.get("source_job_id") or job_id,
                     "title": str(job.get("title") or ""),
                     "company": str(
                         job.get("companyName")
                         or job.get("company")
                         or ""
                     ),
+                    "url": canonical_url,
+                    "source": source_name,
+                    "seen_sources": [source_name],
                     "first_seen": discovered_at.isoformat(),
+                    "first_seen_at": discovered_at.isoformat(),
                     "last_seen": discovered_at.isoformat(),
                     "posted_at": freshness["posted_at_iso"],
+                    "source_posted_at": freshness["posted_at_iso"],
                     "discovery_latency_minutes": freshness[
+                        "discovery_latency_minutes"
+                    ],
+                    "detection_latency_minutes": freshness[
                         "discovery_latency_minutes"
                     ],
                     "status": "stale",
@@ -983,22 +1153,34 @@ def process_jobs_freshness_and_state(
         ):
             print(
                 f"[RETRY ELIGIBLE] '{job.get('title')}' at "
-                f"'{job.get('companyName')}' (Prior status: "
+                f"'{job.get('companyName') or job.get('company')}' (Prior status: "
                 f"{existing_record.get('status')})"
             )
             run_metadata["email_retries"] += 1
             existing_record["last_seen"] = discovered_at.isoformat()
+            seen_sources = existing_record.setdefault("seen_sources", [existing_record.get("source", "linkedin")])
+            if source_name not in seen_sources:
+                seen_sources.append(source_name)
+
+            # If match decision is already known, reuse it rather than calling Groq again
+            if existing_record.get("match_score") is not None:
+                job["match_score"] = existing_record.get("match_score")
+                job["qualification"] = existing_record.get("qualification", "GOOD_MATCH")
+                job["priority"] = existing_record.get("priority", "HIGH")
+                job["_already_scored"] = True
         else:
             print(
                 f"[FRESH DISCOVERY] '{job.get('title')}' at "
-                f"'{job.get('companyName')}' | "
+                f"'{job.get('companyName') or job.get('company')}' [{source_name.upper()}] | "
                 f"Latency: {freshness['latency_formatted']} | "
                 f"Posted: {format_ist_and_utc(freshness['posted_at'])}"
             )
             run_metadata["new_fresh_jobs"] += 1
             # Mark as discovered (pending match and email)
+            now_utc = datetime.now(timezone.utc)
             seen_jobs[job_id] = {
                 "job_id": job_id,
+                "source_job_id": job.get("source_job_id") or job_id,
                 "title": str(job.get("title") or ""),
                 "company": str(
                     job.get("companyName")
@@ -1006,12 +1188,23 @@ def process_jobs_freshness_and_state(
                     or ""
                 ),
                 "url": canonical_url,
+                "source": source_name,
+                "seen_sources": [source_name],
                 "first_seen": discovered_at.isoformat(),
+                "first_seen_at": discovered_at.isoformat(),
                 "last_seen": discovered_at.isoformat(),
+                "processed_at": now_utc.isoformat(),
+                "notified_at": None,
                 "posted_at": freshness["posted_at_iso"],
+                "source_posted_at": freshness["posted_at_iso"],
                 "discovery_latency_minutes": freshness[
                     "discovery_latency_minutes"
                 ],
+                "detection_latency_minutes": freshness[
+                    "discovery_latency_minutes"
+                ],
+                "notification_latency_minutes": None,
+                "priority": "LOW",
                 "status": "discovered",
                 "email_attempts": 0,
             }
@@ -1039,11 +1232,13 @@ def process_jobs_freshness_and_state(
 def score_and_rank_jobs(
     jobs: list[dict],
     run_metadata: dict,
+    state: dict | None = None,
 ) -> list[dict]:
     """
     Two-stage matching pipeline:
     1. Deterministic local relevance filter (AI/ML engineering profile)
     2. Single Groq batch request (with local fallback)
+    Records match outcomes and rejection states in state to prevent redundant Groq calls.
     """
     if not jobs:
         print("No jobs available for matching.")
@@ -1057,36 +1252,69 @@ def score_and_rank_jobs(
     candidates = locally_filter_jobs(jobs)
     run_metadata["candidates_surviving_filter"] = len(candidates)
 
+    seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
+
+    # Record jobs that failed local pre-filter as rejected so they are never evaluated again
+    candidate_ids = {c.get("_job_id") for c in candidates if c.get("_job_id")}
+    for job in jobs:
+        jid = job.get("_job_id")
+        if jid and jid not in candidate_ids and jid in seen_jobs:
+            seen_jobs[jid]["status"] = "rejected"
+            seen_jobs[jid]["reason"] = "local_prefilter_rejected"
+
     if not candidates:
         print("No jobs passed the local AI/ML filter.")
         return []
 
-    print()
-    print("=" * 70)
-    print("AI BATCH MATCHING (GROQ / LOCAL FALLBACK)")
-    print("=" * 70)
+    # Separate candidates: new un-scored vs previously evaluated retries
+    unscored_candidates = [j for j in candidates if not j.get("_already_scored")]
+    already_scored_candidates = [j for j in candidates if j.get("_already_scored")]
 
-    scored_jobs = score_jobs_batch(candidates)
-    if not scored_jobs:
+    scored_new = []
+    if unscored_candidates:
+        print()
+        print("=" * 70)
+        print("AI BATCH MATCHING (GROQ / LOCAL FALLBACK)")
+        print("=" * 70)
+
+        scored_new = score_jobs_batch(unscored_candidates)
+        if scored_new:
+            for j in scored_new:
+                j["priority"] = classify_priority(j)
+                jid = j.get("_job_id")
+                if jid and jid in seen_jobs:
+                    score = j.get("match_score", 0)
+                    seen_jobs[jid]["match_score"] = score
+                    seen_jobs[jid]["qualification"] = j.get("qualification", "MODERATE_MATCH")
+                    seen_jobs[jid]["priority"] = j.get("priority", "LOW")
+                    seen_jobs[jid]["reason"] = j.get("reason", "")
+                    if score < MIN_MATCH_SCORE:
+                        seen_jobs[jid]["status"] = "rejected"
+
+    all_scored = already_scored_candidates + scored_new
+    if not all_scored:
         return []
 
-    scored_jobs.sort(
+    all_scored.sort(
         key=lambda j: j.get("match_score", 0),
         reverse=True,
     )
 
     matched_jobs = [
         j
-        for j in scored_jobs
+        for j in all_scored
         if j.get("match_score", 0) >= MIN_MATCH_SCORE
     ]
 
     run_metadata["high_match_jobs"] = len(matched_jobs)
+    run_metadata["high_priority_jobs"] = sum(
+        1 for j in matched_jobs if j.get("priority") == "HIGH"
+    )
 
     print()
     print(
         f"Jobs meeting {MIN_MATCH_SCORE}+ match threshold: "
-        f"{len(matched_jobs)}"
+        f"{len(matched_jobs)} (High Priority: {run_metadata['high_priority_jobs']})"
     )
 
     return matched_jobs
@@ -1127,19 +1355,21 @@ def send_email_report(
     message["From"] = username
     message["To"] = username
 
+    has_high = any(j.get("priority") == "HIGH" for j in jobs[:MAX_EMAIL_JOBS])
     count = len(jobs[:MAX_EMAIL_JOBS])
+    prefix = "🔥 [HIGH PRIORITY ALERT] " if has_high else ""
     message["Subject"] = (
-        f"AI Job Hunter - {count} High-Match Fresh Jobs "
+        f"{prefix}AI Job Hunter - {count} High-Match Fresh Jobs "
         f"[{format_ist_and_utc(now_utc)}]"
     )
 
     lines = [
-        "AI JOB HUNTER - HOURLY FRESHNESS REPORT",
+        "AI JOB HUNTER - MULTI-SOURCE FRESHNESS REPORT",
         "=" * 70,
         "",
         "RUN METADATA:",
         f"  Run Time: {format_ist_and_utc(now_utc)}",
-        f"  Scraper Provider: {run_metadata.get('scraper_provider', 'apify')}",
+        f"  Scraper Provider: {run_metadata.get('scraper_provider', 'multi-source')}",
         f"  Freshness Window: Last {FRESHNESS_WINDOW_MINUTES} minutes",
         f"  Jobs Retrieved: {run_metadata.get('jobs_retrieved', 0)}",
         (
@@ -1156,6 +1386,10 @@ def send_email_report(
         (
             f"  High-Match (>= {MIN_MATCH_SCORE}): "
             f"{run_metadata.get('high_match_jobs', 0)}"
+        ),
+        (
+            f"  High-Priority Fresh Jobs: "
+            f"{run_metadata.get('high_priority_jobs', 0)}"
         ),
     ]
 
@@ -1190,7 +1424,7 @@ def send_email_report(
                     f"{run_metadata.get('candidates_surviving_filter', 0)}"
                 ),
                 "",
-                "Next hourly scan will execute automatically.",
+                "Next scheduled scan will execute automatically.",
                 "",
                 "=" * 70,
             ]
@@ -1204,10 +1438,13 @@ def send_email_report(
                 or "Unknown Company"
             )
             location = job.get("location", "India")
+            source = str(job.get("source") or "linkedin").upper()
+            priority = job.get("priority", "MEDIUM")
             job_id = job.get("_job_id", "N/A")
             canonical_url = job.get("_canonical_url", "")
             apply_url = (
                 job.get("applyUrl")
+                or job.get("apply_url")
                 or canonical_url
                 or "No link available"
             )
@@ -1238,14 +1475,15 @@ def send_email_report(
 
             lines.extend(
                 [
-                    f"{index}. {title}",
+                    f"{index}. {title} [{priority} PRIORITY]",
                     f"   Company: {company}",
+                    f"   Source: {source}",
                     f"   Location: {location}",
                     "",
                     f"   Posted: {posted_str}",
                     f"   Discovered: {discovered_str}",
-                    f"   Age when discovered: {age_str}",
-                    f"   LinkedIn Job ID: {job_id}",
+                    f"   Detection Latency: {age_str}",
+                    f"   Job ID: {job_id}",
                     "",
                     f"   AI MATCH SCORE: {score}/100 ({qualification})",
                     (
@@ -1254,7 +1492,7 @@ def send_email_report(
                     ),
                     "",
                     f"   Apply: {apply_url}",
-                    f"   LinkedIn: {canonical_url}",
+                    f"   URL: {canonical_url}",
                     "",
                     f"   WHY IT MATCHES: {reason}",
                 ]
@@ -1288,14 +1526,20 @@ def send_email_report(
         run_metadata["emails_sent"] = len(jobs[:MAX_EMAIL_JOBS])
         run_metadata["email_status"] = "success"
 
-        # Update state: mark successfully emailed jobs
+        # Update state: mark successfully emailed jobs with notification timestamps
         sent_now = datetime.now(timezone.utc).isoformat()
         for job in jobs[:MAX_EMAIL_JOBS]:
             jid = job.get("_job_id")
             if jid and jid in seen_jobs:
                 seen_jobs[jid]["status"] = "emailed"
                 seen_jobs[jid]["emailed_at"] = sent_now
+                seen_jobs[jid]["notified_at"] = sent_now
                 seen_jobs[jid]["match_score"] = job.get("match_score", 0)
+                seen_jobs[jid]["priority"] = job.get("priority", "MEDIUM")
+                posted_dt = job.get("_posted_at_dt")
+                if posted_dt:
+                    notif_lat = round((now_utc - posted_dt).total_seconds() / 60.0, 1)
+                    seen_jobs[jid]["notification_latency_minutes"] = max(0.0, notif_lat)
 
     except Exception as error:
         print(f"ERROR: Gmail delivery failed: {error}")
@@ -1316,21 +1560,20 @@ def send_email_report(
 
 
 # ============================================================
-# MAIN PIPELINE
+# MAIN PIPELINE & WORKER LOOP
 # ============================================================
 
-def main():
+def run_pipeline_once(
+    state: dict,
+    force_all: bool = False,
+) -> tuple[list[dict], dict]:
     """
-    Main Hourly AI Job Hunter Execution Pipeline:
-
-    Scheduler (Hourly)
-      -> Scraper (Live Apify / Bright Data)
-      -> Normalization & Stable ID Extraction
-      -> Freshness Pipeline (discovery_latency <= 90 mins)
-      -> Deduplication & State Machine
-      -> Relevance & AI Batch Matching
-      -> Email Notification with Freshness Metrics
-      -> Failsafe State Persistence
+    Executes a single end-to-end acquisition cycle:
+    1. Scrapes due sources (LinkedIn Apify, Remote boards, ATS endpoints).
+    2. Runs cross-source deduplication and freshness evaluation.
+    3. Deterministic pre-filter + Groq batch matching.
+    4. Sends immediate Gmail notifications for high-match jobs.
+    5. Persists state atomically.
     """
     start_time = datetime.now(timezone.utc)
 
@@ -1339,7 +1582,7 @@ def main():
         "run_start_ist": format_ist_and_utc(start_time),
         "run_end_utc": None,
         "run_end_ist": None,
-        "scraper_provider": "apify",
+        "scraper_provider": "multi-source",
         "jobs_retrieved": 0,
         "jobs_within_freshness_window": 0,
         "stale_jobs_filtered": 0,
@@ -1349,6 +1592,7 @@ def main():
         "eligible_jobs": 0,
         "candidates_surviving_filter": 0,
         "high_match_jobs": 0,
+        "high_priority_jobs": 0,
         "emails_sent": 0,
         "email_failures": 0,
         "email_status": "not_attempted",
@@ -1356,20 +1600,13 @@ def main():
         "workflow_errors": [],
     }
 
-    print("=" * 70)
-    print("HOURLY AI JOB HUNTER STARTED")
-    print(f"Start Time: {format_ist_and_utc(start_time)}")
-    print("=" * 70)
-
-    # 1. Load State
-    state = load_state()
-    print(f"Tracked jobs in database: {len(state.get('jobs', {}))}")
+    matched_jobs = []
 
     try:
-        # 2. Scrape Jobs (Live & Fresh)
-        raw_jobs = search_jobs(run_metadata)
+        # 1. Multi-source acquisition
+        raw_jobs = search_jobs(run_metadata, state=state, force_all=force_all)
 
-        # 3. Freshness & Deduplication State Machine
+        # 2. Freshness & Cross-Source Deduplication
         eligible_jobs = process_jobs_freshness_and_state(
             raw_jobs,
             state,
@@ -1377,13 +1614,14 @@ def main():
             run_metadata,
         )
 
-        # 4. Local Relevance + AI Batch Matching
+        # 3. Local Relevance + AI Batch Matching
         matched_jobs = score_and_rank_jobs(
             eligible_jobs,
             run_metadata,
+            state=state,
         )
 
-        # 5. Send Email Report
+        # 4. Email Notification
         print()
         print("=" * 70)
         print("EMAIL REPORT")
@@ -1404,24 +1642,77 @@ def main():
         run_metadata["run_end_ist"] = format_ist_and_utc(end_time)
         state["last_run"] = run_metadata
 
-        # Always save state to disk
+        # Atomic state persistence
         save_state(state)
 
-        print()
-        print("=" * 70)
-        print("RUN EXECUTION SUMMARY")
-        print("=" * 70)
-        print(f"Start: {run_metadata['run_start_ist']}")
-        print(f"End:   {run_metadata['run_end_ist']}")
-        print(f"Provider: {run_metadata['scraper_provider']}")
-        print(f"Scraped: {run_metadata['jobs_retrieved']}")
-        print(f"Fresh (< {FRESHNESS_WINDOW_MINUTES}m): {run_metadata['jobs_within_freshness_window']}")
-        print(f"Stale filtered: {run_metadata['stale_jobs_filtered']}")
-        print(f"Duplicates skipped: {run_metadata['duplicates_skipped']}")
-        print(f"High-match jobs: {run_metadata['high_match_jobs']}")
-        print(f"Email Status: {run_metadata['email_status']}")
-        print("=" * 70)
+    return matched_jobs, run_metadata
+
+
+def run_worker_loop():
+    """
+    Near-Real-Time Persistent Worker Daemon.
+    Continuously polls fast/medium/slow sources according to their individual intervals.
+    Dispatches immediate alerts when high-priority fresh jobs appear.
+    """
+    print("=" * 70)
+    print("AI JOB HUNTER - PERSISTENT WORKER STARTED (NEAR-REAL-TIME MODE)")
+    print("Polling sources according to individual intervals (Press Ctrl+C to stop).")
+    print("=" * 70)
+
+    state = load_state()
+    try:
+        while True:
+            matched_jobs, meta = run_pipeline_once(state, force_all=False)
+            time.sleep(30)
+    except KeyboardInterrupt:
+        print("\nWorker loop terminated by user.")
+    finally:
+        save_state(state)
+
+
+def main():
+    """
+    Standard single-pass execution used by GitHub Actions and scheduled runs.
+    """
+    start_time = datetime.now(timezone.utc)
+    print("=" * 70)
+    print("AI JOB HUNTER PIPELINE STARTED")
+    print(f"Start Time: {format_ist_and_utc(start_time)}")
+    print("=" * 70)
+
+    state = load_state()
+    print(f"Tracked jobs in database: {len(state.get('jobs', {}))}")
+
+    matched_jobs, run_metadata = run_pipeline_once(state, force_all=True)
+
+    print()
+    print("=" * 70)
+    print("RUN EXECUTION SUMMARY")
+    print("=" * 70)
+    print(f"Start: {run_metadata['run_start_ist']}")
+    print(f"End:   {run_metadata['run_end_ist']}")
+    print(f"Provider: {run_metadata.get('scraper_provider', 'multi-source')}")
+    print(f"Scraped: {run_metadata['jobs_retrieved']}")
+    print(f"Fresh (< {FRESHNESS_WINDOW_MINUTES}m): {run_metadata['jobs_within_freshness_window']}")
+    print(f"Stale filtered: {run_metadata['stale_jobs_filtered']}")
+    print(f"Duplicates skipped: {run_metadata['duplicates_skipped']}")
+    print(f"High-match jobs: {run_metadata['high_match_jobs']}")
+    print(f"High-priority fresh jobs: {run_metadata.get('high_priority_jobs', 0)}")
+    print(f"Email Status: {run_metadata['email_status']}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    main()
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("AI Job Hunter - Multi-Source Real-Time Pipeline")
+        print("Usage: python main.py [options]")
+        print("Options:")
+        print("  --worker, --daemon : Run continuously as a lightweight background polling daemon")
+        print("  --dry-run          : Run one acquisition pass without sending emails")
+        print("  --help, -h         : Show this help message and exit")
+        sys.exit(0)
+
+    if "--worker" in sys.argv or "--daemon" in sys.argv or os.environ.get("RUN_MODE") == "worker":
+        run_worker_loop()
+    else:
+        main()
