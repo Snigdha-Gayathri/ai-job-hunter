@@ -45,7 +45,7 @@ logger = logging.getLogger("ai_job_hunter.sources")
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36 (AIJobHunter/2.0)"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 
 # Common tracking / noise query parameters to strip for canonical URLs
@@ -291,8 +291,8 @@ class BaseSource:
         url: str,
         params: dict | None = None,
         headers: dict | None = None,
-        timeout: int = 15,
-        max_retries: int = 2,
+        timeout: int = 12,
+        max_retries: int = 1,
     ) -> requests.Response | None:
         """
         Execute an HTTP GET with failure isolation, backoff, and timeouts.
@@ -369,6 +369,7 @@ class RemoteOKSource(BaseSource):
             if isinstance(data, list):
                 # Remote OK returns legal notice as first element
                 jobs = [j for j in data if isinstance(j, dict) and "position" in j]
+                jobs.sort(key=lambda j: str(j.get("epoch") or j.get("date") or ""), reverse=True)
                 return jobs[:self.max_results]
         except Exception as e:
             logger.warning(f"Remote OK parse error: {e}")
@@ -428,6 +429,7 @@ class RemotiveSource(BaseSource):
         try:
             data = resp.json()
             jobs = data.get("jobs", []) if isinstance(data, dict) else []
+            jobs.sort(key=lambda j: str(j.get("publication_date") or ""), reverse=True)
             return jobs[:self.max_results]
         except Exception as e:
             logger.warning(f"Remotive parse error: {e}")
@@ -486,6 +488,7 @@ class WorkingNomadsSource(BaseSource):
         try:
             data = resp.json()
             if isinstance(data, list):
+                data.sort(key=lambda j: str(j.get("pub_date") or ""), reverse=True)
                 return data[:self.max_results]
         except Exception as e:
             logger.warning(f"Working Nomads parse error: {e}")
@@ -532,17 +535,19 @@ class WeWorkRemotelySource(BaseSource):
     def fetch(self) -> list[dict]:
         feeds = self.config.get("feeds", [
             "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+            "https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss",
         ])
         results = []
         for feed_url in feeds:
             try:
-                resp = self.safe_get(feed_url, timeout=10)
+                resp = self.safe_get(feed_url, timeout=12)
                 if resp and resp.status_code == 200:
                     items = parse_rss_items(resp.text)
                     results.extend(items)
             except Exception as e:
                 logger.warning(f"WWR feed error ({feed_url}): {e}")
 
+        results.sort(key=lambda j: str(j.get("pubdate") or ""), reverse=True)
         return results[:self.max_results]
 
     def normalize(self, raw: dict, discovered_at: datetime) -> dict:
@@ -591,12 +596,14 @@ class NoDeskSource(BaseSource):
 
     def fetch(self) -> list[dict]:
         feed_url = self.config.get("feed", "https://nodesk.co/remote-jobs/index.xml")
-        resp = self.safe_get(feed_url, timeout=10)
+        resp = self.safe_get(feed_url, timeout=12)
         if not resp or resp.status_code != 200:
             return []
 
         try:
-            return parse_rss_items(resp.text)[:self.max_results]
+            items = parse_rss_items(resp.text)
+            items.sort(key=lambda j: str(j.get("pubdate") or ""), reverse=True)
+            return items[:self.max_results]
         except Exception as e:
             logger.warning(f"NoDesk parse error: {e}")
             return []
@@ -650,11 +657,12 @@ class SkipTheDriveSource(BaseSource):
     def fetch(self) -> list[dict]:
         feed_url = self.config.get("feed", "https://www.skipthedrive.com/jobs/feed/")
         try:
-            resp = self.safe_get(feed_url, timeout=10)
+            resp = self.safe_get(feed_url, timeout=6, max_retries=0)
             if resp and resp.status_code == 200 and "<item" in resp.text:
                 return parse_rss_items(resp.text)[:self.max_results]
         except Exception as e:
             logger.warning(f"SkipTheDrive fetch error: {e}")
+        logger.info("[skipthedrive] UNAVAILABLE: Feed endpoint rejected SSL handshake (anti-bot / TLS error)")
         return []
 
     def normalize(self, raw: dict, discovered_at: datetime) -> dict:
@@ -691,11 +699,12 @@ class RemoteCoSource(BaseSource):
     def fetch(self) -> list[dict]:
         feed_url = self.config.get("feed", "https://remote.co/remote-jobs/developer/feed/")
         try:
-            resp = self.safe_get(feed_url, timeout=10)
+            resp = self.safe_get(feed_url, timeout=6, max_retries=0)
             if resp and resp.status_code == 200 and "<item" in resp.text:
                 return parse_rss_items(resp.text)[:self.max_results]
         except Exception as e:
             logger.warning(f"Remote.co fetch error: {e}")
+        logger.info("[remoteco] UNAVAILABLE: Feed endpoint offline / access restricted")
         return []
 
     def normalize(self, raw: dict, discovered_at: datetime) -> dict:
@@ -730,8 +739,7 @@ class Remote100KSource(BaseSource):
     """
 
     def fetch(self) -> list[dict]:
-        # Remote100K does not offer open unauthenticated feeds;
-        # structured query with graceful empty return when endpoint is unavailable
+        logger.info("[remote100k] LIMITED: Platform requires browser rendering; no open public API")
         return []
 
     def normalize(self, raw: dict, discovered_at: datetime) -> dict:
@@ -757,7 +765,7 @@ class JustRemoteSource(BaseSource):
     """
 
     def fetch(self) -> list[dict]:
-        # JustRemote provides server-rendered HTML frontend; returns empty if no open feed
+        logger.info("[justremote] LIMITED: Platform requires browser session; no open public API")
         return []
 
     def normalize(self, raw: dict, discovered_at: datetime) -> dict:
@@ -784,7 +792,7 @@ class JustRemoteSource(BaseSource):
 class GreenhouseSource(BaseSource):
     """
     Acquires open job listings directly from company Greenhouse job boards.
-    Endpoint: https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true
+    Endpoint: https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=false
     """
 
     def fetch(self) -> list[dict]:
@@ -793,37 +801,50 @@ class GreenhouseSource(BaseSource):
 
         for token in companies:
             url = f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs"
-            params = {"content": "true"}
+            params = {"content": "false"}
             try:
-                resp = self.safe_get(url, params=params, timeout=10)
+                resp = self.safe_get(url, params=params, timeout=15)
                 if resp and resp.status_code == 200:
                     data = resp.json()
                     jobs = data.get("jobs", []) if isinstance(data, dict) else []
-                    for j in jobs:
+                    jobs.sort(key=lambda j: str(j.get("updated_at") or j.get("first_published") or ""), reverse=True)
+                    
+                    # Prioritize AI/ML, tech, data, and engineer roles across all boards
+                    tech_jobs = [
+                        j for j in jobs
+                        if any(k in str(j.get("title", "")).lower() for k in [
+                            "ai", "machine learning", "ml", "genai", "llm", "engineer", "developer", 
+                            "data", "research", "intern", "applied", "software", "scientist"
+                        ])
+                    ]
+                    selected = tech_jobs[:25] if tech_jobs else jobs[:10]
+                    for j in selected:
                         j["_company_token"] = token
-                    all_jobs.extend(jobs)
+                    all_jobs.extend(selected)
+                    logger.info(f"[greenhouse:{token}] HTTP 200 | total={len(jobs)} | selected={len(selected)}")
             except Exception as e:
                 logger.warning(f"Greenhouse error for {token}: {e}")
 
+        all_jobs.sort(key=lambda j: str(j.get("updated_at") or j.get("first_published") or ""), reverse=True)
         return all_jobs[:self.max_results]
 
     def normalize(self, raw: dict, discovered_at: datetime) -> dict:
         source_id = str(raw.get("id") or "").strip()
         title = str(raw.get("title") or "").strip()
-        company = raw.get("_company_token", "").replace("-", " ").title()
+        company = raw.get("company_name") or raw.get("_company_token", "").replace("-", " ").title()
         location_obj = raw.get("location") or {}
-        location = location_obj.get("name") if isinstance(location_obj, dict) else "Unknown"
+        location = location_obj.get("name") if isinstance(location_obj, dict) else str(location_obj or "Unknown")
 
         raw_url = str(raw.get("absolute_url") or "")
         canonical_url = normalize_url(raw_url)
         description = str(raw.get("content") or "")
 
-        updated_at = raw.get("updated_at")
+        updated_at = raw.get("updated_at") or raw.get("first_published")
         posted_at = parse_iso_or_epoch(updated_at)
 
         return {
             "title": title,
-            "company": company,
+            "company": str(company),
             "location": location,
             "remote_type": "remote" if "remote" in location.lower() else "unspecified",
             "description": description,
@@ -860,16 +881,27 @@ class LeverSource(BaseSource):
             url = f"https://api.lever.co/v0/postings/{company_id}"
             params = {"mode": "json"}
             try:
-                resp = self.safe_get(url, params=params, timeout=10)
+                resp = self.safe_get(url, params=params, timeout=15)
                 if resp and resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, list):
-                        for j in data:
+                        data.sort(key=lambda j: str(j.get("createdAt") or ""), reverse=True)
+                        tech_jobs = [
+                            j for j in data
+                            if any(k in str(j.get("text", "")).lower() for k in [
+                                "ai", "machine learning", "ml", "genai", "llm", "engineer", "developer", 
+                                "data", "research", "intern", "applied", "software", "scientist"
+                            ])
+                        ]
+                        selected = tech_jobs[:25] if tech_jobs else data[:10]
+                        for j in selected:
                             j["_company_id"] = company_id
-                        all_jobs.extend(data)
+                        all_jobs.extend(selected)
+                        logger.info(f"[lever:{company_id}] HTTP 200 | total={len(data)} | selected={len(selected)}")
             except Exception as e:
                 logger.warning(f"Lever error for {company_id}: {e}")
 
+        all_jobs.sort(key=lambda j: str(j.get("createdAt") or ""), reverse=True)
         return all_jobs[:self.max_results]
 
     def normalize(self, raw: dict, discovered_at: datetime) -> dict:
@@ -927,16 +959,27 @@ class AshbySource(BaseSource):
         for slug in companies:
             url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
             try:
-                resp = self.safe_get(url, timeout=10)
+                resp = self.safe_get(url, timeout=15)
                 if resp and resp.status_code == 200:
                     data = resp.json()
                     jobs = data.get("jobs", []) if isinstance(data, dict) else []
-                    for j in jobs:
+                    jobs.sort(key=lambda j: str(j.get("publishedAt") or ""), reverse=True)
+                    tech_jobs = [
+                        j for j in jobs
+                        if any(k in str(j.get("title", "")).lower() for k in [
+                            "ai", "machine learning", "ml", "genai", "llm", "engineer", "developer", 
+                            "data", "research", "intern", "applied", "software", "scientist"
+                        ])
+                    ]
+                    selected = tech_jobs[:25] if tech_jobs else jobs[:10]
+                    for j in selected:
                         j["_org_slug"] = slug
-                    all_jobs.extend(jobs)
+                    all_jobs.extend(selected)
+                    logger.info(f"[ashby:{slug}] HTTP 200 | total={len(jobs)} | selected={len(selected)}")
             except Exception as e:
                 logger.warning(f"Ashby error for {slug}: {e}")
 
+        all_jobs.sort(key=lambda j: str(j.get("publishedAt") or ""), reverse=True)
         return all_jobs[:self.max_results]
 
     def normalize(self, raw: dict, discovered_at: datetime) -> dict:
@@ -1004,6 +1047,7 @@ class AggregatorSource(BaseSource):
                     return resp.json()[:self.max_results]
             except Exception as e:
                 logger.warning(f"[{self.source_id}] Custom endpoint error: {e}")
+        logger.info(f"[{self.source_id}] LIMITED: Platform uses anti-bot/session auth. Configure {self.source_id.upper()}_FEED_URL to connect.")
         return []
 
     def normalize(self, raw: dict, discovered_at: datetime) -> dict:

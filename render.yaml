@@ -1,0 +1,27 @@
+services:
+  - type: worker
+    name: ai-job-hunter-worker
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python agent/main.py --worker
+    disk:
+      name: job-hunter-state
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: RUN_MODE
+        value: worker
+      - key: STATE_DIR
+        value: /data
+      - key: APIFY_API_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GMAIL_USERNAME
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false

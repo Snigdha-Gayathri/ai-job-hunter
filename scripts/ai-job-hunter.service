@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Job Hunter Continuous Polling Worker Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/ai-job-hunter
+EnvironmentFile=/opt/ai-job-hunter/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=STATE_DIR=/opt/ai-job-hunter/agent/state
+ExecStart=/usr/bin/python3 agent/main.py --worker
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

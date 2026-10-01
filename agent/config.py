@@ -221,6 +221,17 @@ TARGET_ROLE_FAMILIES = [
     "AI Software Engineer",
     "Junior AI Engineer",
     "Associate AI Engineer",
+    "AI Engineer Intern",
+    "ML Engineer Intern",
+    "Machine Learning Intern",
+    "GenAI Engineer Intern",
+    "GenAI Intern",
+    "LLM Intern",
+    "GenAI/LLM Intern",
+    "Agentic AI Intern",
+    "Applied AI Intern",
+    "AI Research Intern",
+    "AI Intern",
 ]
 
 TARGET_LOCATIONS = [
@@ -253,16 +264,34 @@ TARGET_EXPERIENCE_KEYWORDS = [
     "new grad",
     "junior",
     "associate",
+    "intern",
+    "internship",
+    "trainee",
+    "student",
 ]
 
 
 # ============================================================
-# PRIORITY / ALERTING THRESHOLDS
+# PRIORITY / ALERTING THRESHOLDS & FRESHNESS WINDOWS
 # ============================================================
 
 HIGH_PRIORITY_SCORE = 80
 MEDIUM_PRIORITY_SCORE = 65
-HIGH_PRIORITY_MAX_AGE_MINUTES = 180  # 3 hours
+HIGH_PRIORITY_MAX_AGE_MINUTES = 180  # 3 hours (immediate alert)
+
+# Fast-stream Freshness Window (e.g. LinkedIn hourly execution):
+# Targets jobs posted within the last 90 minutes.
+FRESHNESS_WINDOW_MINUTES = int(os.environ.get("FRESHNESS_WINDOW_MINUTES", "90"))
+
+# Active Posting Freshness Window for ATS & Remote Job Boards:
+# Eligible jobs posted within the last 48 hours are processed and evaluated upon first discovery.
+# Stale back-catalog listings (> 48h) are filtered out.
+# Once processed, persistent state ensures jobs are NEVER emailed or re-processed again.
+ATS_FRESHNESS_WINDOW_HOURS = int(os.environ.get("ATS_FRESHNESS_WINDOW_HOURS", "48"))
+ATS_FRESHNESS_WINDOW_MINUTES = int(
+    os.environ.get("ATS_FRESHNESS_WINDOW_MINUTES", str(ATS_FRESHNESS_WINDOW_HOURS * 60))
+)
+FRESHNESS_WINDOW_HOURS = ATS_FRESHNESS_WINDOW_HOURS
 
 
 # ============================================================
@@ -319,7 +348,7 @@ SOURCES_CONFIG = {
         "enabled": os.getenv("ENABLE_REMOTEOK", "true").lower() == "true",
         "category": "remote_board",
         "acquisition_method": "json_api",
-        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_REMOTEOK", "5")),
+        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_REMOTEOK", "3")),
         "max_results": 50,
         "endpoint": "https://remoteok.com/api",
     },
@@ -349,7 +378,7 @@ SOURCES_CONFIG = {
         "enabled": os.getenv("ENABLE_WEWORKREMOTELY", "true").lower() == "true",
         "category": "remote_board",
         "acquisition_method": "rss_feed",
-        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_WWR", "10")),
+        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_WWR", "5")),
         "max_results": 40,
         "feeds": [
             "https://weworkremotely.com/categories/remote-programming-jobs.rss",
@@ -362,7 +391,7 @@ SOURCES_CONFIG = {
         "enabled": os.getenv("ENABLE_NODESK", "true").lower() == "true",
         "category": "remote_board",
         "acquisition_method": "rss_feed",
-        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_NODESK", "15")),
+        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_NODESK", "10")),
         "max_results": 30,
         "feed": "https://nodesk.co/remote-jobs/index.xml",
     },
@@ -410,7 +439,7 @@ SOURCES_CONFIG = {
         "enabled": os.getenv("ENABLE_GREENHOUSE", "true").lower() == "true",
         "category": "ats",
         "acquisition_method": "json_api",
-        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_GREENHOUSE", "5")),
+        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_GREENHOUSE", "3")),
         "max_results": 50,
         "companies": ATS_TARGET_COMPANIES["greenhouse"],
     },
@@ -420,7 +449,7 @@ SOURCES_CONFIG = {
         "enabled": os.getenv("ENABLE_LEVER", "true").lower() == "true",
         "category": "ats",
         "acquisition_method": "json_api",
-        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_LEVER", "5")),
+        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_LEVER", "3")),
         "max_results": 50,
         "companies": ATS_TARGET_COMPANIES["lever"],
     },
@@ -430,7 +459,7 @@ SOURCES_CONFIG = {
         "enabled": os.getenv("ENABLE_ASHBY", "true").lower() == "true",
         "category": "ats",
         "acquisition_method": "json_api",
-        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_ASHBY", "5")),
+        "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_ASHBY", "3")),
         "max_results": 50,
         "companies": ATS_TARGET_COMPANIES["ashby"],
     },

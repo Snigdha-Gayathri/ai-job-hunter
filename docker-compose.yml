@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  ai-job-hunter-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-job-hunter-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - RUN_MODE=worker
+      - STATE_DIR=/data
+      - DRY_RUN=false
+    volumes:
+      - job_hunter_state:/data
+    networks:
+      - job_hunter_net
+
+volumes:
+  job_hunter_state:
+    name: ai_job_hunter_persistent_state
+
+networks:
+  job_hunter_net:
+    driver: bridge
