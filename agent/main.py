@@ -3,12 +3,19 @@ import os
 import re
 import smtplib
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
 import sys
 import requests
+
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from job_matcher import (
     locally_filter_jobs,
@@ -22,6 +29,11 @@ from sources import (
 from config import (
     SOURCES_CONFIG,
     HIGH_PRIORITY_SCORE,
+    FRESHNESS_WINDOW_MINUTES,
+    FRESHNESS_WINDOW_HOURS,
+    HIGH_PRIORITY_MAX_AGE_MINUTES,
+    TARGET_LOCATIONS as CONFIG_TARGET_LOCATIONS,
+    TARGET_ROLE_FAMILIES,
 )
 
 
@@ -49,13 +61,8 @@ APIFY_URL = (
 )
 
 # Freshness Configuration:
-# Hourly execution targets jobs posted since the last hourly run.
-# A 90-minute window provides an intentional 30-minute safety buffer
-# for clock drift, scraper delays, and LinkedIn indexing delays,
-# without allowing stale jobs (e.g. 4+ hours old) to pass through.
-FRESHNESS_WINDOW_MINUTES = int(
-    os.environ.get("FRESHNESS_WINDOW_MINUTES", "90")
-)
+# Configured via FRESHNESS_WINDOW_MINUTES (default: 48 hours for active postings)
+# High-priority alert window: posted within last 3 hours (180 mins)
 
 # Limits
 MAX_EMAIL_JOBS = 20
@@ -64,7 +71,7 @@ MIN_MATCH_SCORE = 75
 
 # Persistent state management
 BASE_DIR = Path(__file__).resolve().parent
-STATE_DIR = BASE_DIR / "state"
+STATE_DIR = Path(os.environ.get("STATE_DIR", str(BASE_DIR / "state")))
 STATE_FILE = STATE_DIR / "seen_jobs.json"
 METRICS_FILE = STATE_DIR / "last_run_metrics.json"
 
@@ -330,13 +337,28 @@ def parse_posted_time(
     if reference_time is None:
         reference_time = datetime.now(timezone.utc)
 
+    # Check if already a datetime
+    for k in ("source_posted_at", "posted_at", "postedAt", "published_at"):
+        val = job.get(k)
+        if isinstance(val, datetime):
+            if val.tzinfo is None:
+                val = val.replace(tzinfo=timezone.utc)
+            return val.astimezone(timezone.utc)
+
     raw = (
-        job.get("postedAt")
+        job.get("source_posted_at")
+        or job.get("posted_at")
+        or job.get("postedAt")
         or job.get("postedDate")
         or job.get("postedAtText")
         or job.get("date")
         or job.get("date_text")
         or job.get("time")
+        or job.get("updated_at")
+        or job.get("publishedAt")
+        or job.get("pubDate")
+        or job.get("pub_date")
+        or job.get("publication_date")
         or ""
     )
 
@@ -414,8 +436,10 @@ def calculate_freshness(
       discovery_latency = scraper_discovered_at - linkedin_posted_at
     """
     posted_at = job.get("source_posted_at")
-    if posted_at is None:
+    if not isinstance(posted_at, datetime):
         posted_at = parse_posted_time(job, reference_time=discovered_at)
+
+    source_name = str(job.get("source") or "").lower()
 
     if posted_at is None:
         raw_posted = str(
@@ -426,13 +450,13 @@ def calculate_freshness(
             or ""
         ).strip()
         # If source has no date field at all and is not LinkedIn, treat as fresh on initial discovery
-        if not raw_posted and job.get("source") and job.get("source") != "linkedin":
+        if not raw_posted and source_name and source_name != "linkedin":
             return {
                 "posted_at": None,
                 "posted_at_iso": None,
                 "discovered_at_iso": discovered_at.isoformat(),
                 "discovery_latency_minutes": None,
-                "latency_formatted": "Newly discovered (no timestamp)",
+                "latency_formatted": "Newly discovered (no source timestamp)",
                 "is_fresh": True,
                 "freshness_reason": "Freshly acquired from source without explicit posting timestamp.",
             }
@@ -457,23 +481,34 @@ def calculate_freshness(
         age_str = "< 1 minute"
     elif latency_minutes < 60:
         age_str = f"{int(round(latency_minutes))} minutes"
-    else:
+    elif latency_minutes < 1440:
         hours = round(latency_minutes / 60.0, 1)
         age_str = f"{hours} hours"
+    else:
+        days = round(latency_minutes / 1440.0, 1)
+        age_str = f"{days} days"
+
+    # Source-specific freshness window:
+    # LinkedIn: fast-stream window (default 90m for hourly freshness, configurable)
+    # ATS and Remote boards: active posting window (48 hours = 2880m)
+    if source_name in ("greenhouse", "lever", "ashby", "remoteok", "remotive", "workingnomads", "weworkremotely", "nodesk"):
+        source_window_minutes = int(os.environ.get("ATS_FRESHNESS_WINDOW_MINUTES", "2880"))
+    else:
+        source_window_minutes = FRESHNESS_WINDOW_MINUTES
 
     # Enforce freshness window
-    # Allow small negative latency (up to -2 mins) for minor server clock desync
-    if -2 <= latency_minutes <= FRESHNESS_WINDOW_MINUTES:
+    # Allow small negative latency (up to -5 mins) for minor server clock desync
+    if -5 <= latency_minutes <= source_window_minutes:
         is_fresh = True
         reason = (
             f"Fresh: posted {age_str} ago "
-            f"(within {FRESHNESS_WINDOW_MINUTES}m window)"
+            f"(within {source_window_minutes}m window)"
         )
-    elif latency_minutes > FRESHNESS_WINDOW_MINUTES:
+    elif latency_minutes > source_window_minutes:
         is_fresh = False
         reason = (
             f"Stale: posted {age_str} ago "
-            f"(exceeds {FRESHNESS_WINDOW_MINUTES}m window)"
+            f"(exceeds {source_window_minutes}m window)"
         )
     else:
         is_fresh = False
@@ -953,64 +988,144 @@ def search_jobs(
     force_all: bool = False,
 ) -> list[dict]:
     """
-    Multi-source acquisition dispatcher:
-    1. Dispatches to LinkedIn Apify (or Bright Data if chosen).
-    2. Dispatches to all due remote boards and ATS sources from SourceRegistry.
-    3. Failure in any single source is isolated so it never crashes the pipeline.
-    Tags all retrieved items with canonical discovery metadata.
+    Multi-source acquisition dispatcher with ThreadPoolExecutor concurrency:
+    1. Determines due sources based on source-specific polling intervals.
+    2. Fetches all due sources concurrently so slow sources never block fast sources.
+    3. Failure in any single source is fully isolated and does not crash the pipeline.
+    4. Independent timeout, failure handling, and latency logging per source.
     """
     discovered_at = datetime.now(timezone.utc)
     source_states = state.setdefault("sources", {}) if state is not None else {}
     tagged_jobs = []
 
-    # 1. Existing LinkedIn Scraper
+    t_src_start = time.time()
+    source_stats = run_metadata.setdefault("source_stats", {})
+
+    # Check if LinkedIn is due
     linkedin_due = force_all or (
         source_states.get("linkedin", {}).get("last_polled") is None
         or (discovered_at - datetime.fromisoformat(source_states["linkedin"]["last_polled"])).total_seconds() >= 25 * 60
     )
 
-    if linkedin_due:
-        source_states.setdefault("linkedin", {})["last_polled"] = discovered_at.isoformat()
-        provider_pref = os.environ.get("SCRAPER_PROVIDER", "apify").lower()
-
-        if provider_pref == "bright_data" and BRIGHT_DATA_API_KEY:
-            run_metadata["scraper_provider"] = "bright_data"
-            raw_jobs = search_jobs_brightdata(run_metadata)
-        else:
-            run_metadata["scraper_provider"] = "apify"
-            raw_jobs = search_jobs_apify(run_metadata)
-
-        for item in raw_jobs:
-            if isinstance(item, dict):
-                item["_scraper_discovered_at"] = discovered_at
-                item["_source_provider"] = run_metadata["scraper_provider"]
-                item.setdefault("source", "linkedin")
-                tagged_jobs.append(item)
-
-        source_states["linkedin"]["last_success"] = discovered_at.isoformat()
-        source_states["linkedin"]["consecutive_failures"] = 0
-
-    # 2. Multi-source acquisition via SourceRegistry
+    # Get due sources from registry
     due_sources = source_registry.get_due_sources(discovered_at, source_states, force_all=force_all)
-    if due_sources:
-        print()
-        print("=" * 70)
-        print(f"MULTI-SOURCE ACQUISITION ({len(due_sources)} due sources)")
-        print("=" * 70)
 
-        for src in due_sources:
-            try:
-                print(f"Fetching from {src.name} ({src.config.get('acquisition_method')})...")
-                src_jobs = source_registry.fetch_source_jobs(src, discovered_at, source_states)
-                print(f"  [{src.name}] Fetched {len(src_jobs)} jobs.")
-                for item in src_jobs:
-                    item["_scraper_discovered_at"] = discovered_at
-                    item["_source_provider"] = src.source_id
-                    tagged_jobs.append(item)
-            except Exception as error:
-                err_msg = f"[{src.name}] Acquisition error: {error}"
-                print(f"ERROR: {err_msg}")
-                run_metadata["scraper_errors"].append(err_msg)
+    def fetch_single_source(src):
+        t_s = time.time()
+        try:
+            raw_items = src.fetch()
+            normalized = []
+            for item in raw_items:
+                norm = src.normalize(item, discovered_at)
+                normalized.append(norm)
+            elapsed = round(time.time() - t_s, 2)
+            if normalized:
+                status = "OK"
+            elif src.source_id in ("remote100k", "justremote", "indeed", "wellfound", "naukri", "instahyre", "cutshort", "foundit", "hirist"):
+                status = "LIMITED"
+            elif src.source_id in ("skipthedrive", "remoteco"):
+                status = "UNAVAILABLE"
+            else:
+                status = "EMPTY"
+            return src.source_id, src.name, normalized, status, elapsed, None
+        except Exception as error:
+            elapsed = round(time.time() - t_s, 2)
+            err_msg = f"{type(error).__name__}: {str(error)}"
+            return src.source_id, src.name, [], "FAILED", elapsed, err_msg
+
+    def fetch_linkedin():
+        t_li = time.time()
+        provider_pref = os.environ.get("SCRAPER_PROVIDER", "apify").lower()
+        try:
+            if provider_pref == "bright_data" and BRIGHT_DATA_API_KEY:
+                run_metadata["scraper_provider"] = "bright_data"
+                raw = search_jobs_brightdata(run_metadata)
+            elif APIFY_TOKEN:
+                run_metadata["scraper_provider"] = "apify"
+                raw = search_jobs_apify(run_metadata)
+            else:
+                return "linkedin", "LinkedIn (Apify)", [], "UNAVAILABLE", round(time.time() - t_li, 2), "APIFY_API_TOKEN not configured"
+            status = "OK" if raw else "EMPTY"
+            return "linkedin", "LinkedIn", raw, status, round(time.time() - t_li, 2), None
+        except Exception as error:
+            err_msg = f"{type(error).__name__}: {str(error)}"
+            return "linkedin", "LinkedIn", [], "FAILED", round(time.time() - t_li, 2), err_msg
+
+    total_tasks = len(due_sources) + (1 if linkedin_due else 0)
+    print()
+    print("=" * 70)
+    print(f"PARALLEL MULTI-SOURCE ACQUISITION ({total_tasks} sources due: LinkedIn={linkedin_due}, Registry={len(due_sources)})")
+    print("=" * 70)
+
+    if total_tasks > 0:
+        max_workers = min(total_tasks, 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_sid = {}
+
+            if linkedin_due:
+                source_states.setdefault("linkedin", {})["last_polled"] = discovered_at.isoformat()
+                fut = executor.submit(fetch_linkedin)
+                future_to_sid[fut] = "linkedin"
+
+            for src in due_sources:
+                fut = executor.submit(fetch_single_source, src)
+                future_to_sid[fut] = src.source_id
+
+            for fut in as_completed(future_to_sid):
+                sid = future_to_sid[fut]
+                try:
+                    source_id, source_name, jobs, status, elapsed, err = fut.result()
+                except Exception as exc:
+                    source_id = sid
+                    source_name = sid.title()
+                    jobs = []
+                    status = "FAILED"
+                    elapsed = 0.0
+                    err = str(exc)
+
+                print(f"  [{source_name}] Completed in {elapsed}s | Status: {status} | Jobs: {len(jobs)}")
+
+                s_state = source_states.setdefault(source_id, {
+                    "last_polled": discovered_at.isoformat(),
+                    "last_success": None,
+                    "last_failure": None,
+                    "consecutive_failures": 0,
+                    "jobs_fetched": 0,
+                    "last_error": None,
+                })
+                s_state["last_polled"] = discovered_at.isoformat()
+
+                if err:
+                    run_metadata["scraper_errors"].append(f"[{source_name}] {err}")
+                    s_state["last_failure"] = discovered_at.isoformat()
+                    s_state["consecutive_failures"] = s_state.get("consecutive_failures", 0) + 1
+                    s_state["last_error"] = err
+                    source_stats[source_id] = {
+                        "name": source_name,
+                        "status": "FAILED",
+                        "raw": 0,
+                        "valid": 0,
+                        "error": err,
+                        "elapsed": elapsed,
+                    }
+                else:
+                    s_state["last_success"] = discovered_at.isoformat()
+                    s_state["consecutive_failures"] = 0
+                    s_state["jobs_fetched"] = s_state.get("jobs_fetched", 0) + len(jobs)
+                    s_state["last_error"] = None
+                    source_stats[source_id] = {
+                        "name": source_name,
+                        "status": status,
+                        "raw": len(jobs),
+                        "valid": len(jobs),
+                        "elapsed": elapsed,
+                    }
+                    for item in jobs:
+                        if isinstance(item, dict):
+                            item["_scraper_discovered_at"] = discovered_at
+                            item["_source_provider"] = source_id
+                            item.setdefault("source", source_id)
+                            tagged_jobs.append(item)
 
     run_metadata["jobs_retrieved"] = len(tagged_jobs)
     return tagged_jobs
@@ -1175,7 +1290,7 @@ def process_jobs_freshness_and_state(
                 f"Latency: {freshness['latency_formatted']} | "
                 f"Posted: {format_ist_and_utc(freshness['posted_at'])}"
             )
-            run_metadata["new_fresh_jobs"] += 1
+            run_metadata["new_fresh_jobs"] = run_metadata.get("new_fresh_jobs", 0) + 1
             # Mark as discovered (pending match and email)
             now_utc = datetime.now(timezone.utc)
             seen_jobs[job_id] = {
@@ -1337,8 +1452,8 @@ def send_email_report(
     - Atomic status transition: sets status='emailed' only upon verified send;
       sets status='email_failed' on error so jobs remain eligible for retry!
     """
-    username = GMAIL_USERNAME
-    app_password = GMAIL_APP_PASSWORD
+    username = os.environ.get("GMAIL_USERNAME") or GMAIL_USERNAME
+    app_password = os.environ.get("GMAIL_APP_PASSWORD") or GMAIL_APP_PASSWORD
 
     if not username or not app_password:
         print(
@@ -1604,33 +1719,51 @@ def run_pipeline_once(
 
     try:
         # 1. Multi-source acquisition
+        t0 = time.time()
         raw_jobs = search_jobs(run_metadata, state=state, force_all=force_all)
+        t_retrieval = round(time.time() - t0, 2)
+        run_metadata["latency_retrieval_sec"] = t_retrieval
 
         # 2. Freshness & Cross-Source Deduplication
+        t1 = time.time()
         eligible_jobs = process_jobs_freshness_and_state(
             raw_jobs,
             state,
             start_time,
             run_metadata,
         )
+        t_dedup = round(time.time() - t1, 2)
+        run_metadata["latency_dedup_sec"] = t_dedup
 
         # 3. Local Relevance + AI Batch Matching
+        t2 = time.time()
         matched_jobs = score_and_rank_jobs(
             eligible_jobs,
             run_metadata,
             state=state,
         )
+        t_matching = round(time.time() - t2, 2)
+        run_metadata["latency_matching_sec"] = t_matching
 
         # 4. Email Notification
-        print()
-        print("=" * 70)
-        print("EMAIL REPORT")
-        print("=" * 70)
-        send_email_report(
-            jobs=matched_jobs,
-            run_metadata=run_metadata,
-            state=state,
-        )
+        t3 = time.time()
+        dry_run = "--dry-run" in sys.argv or os.environ.get("DRY_RUN", "false").lower() == "true"
+        if not dry_run:
+            print()
+            print("=" * 70)
+            print("EMAIL REPORT")
+            print("=" * 70)
+            send_email_report(
+                jobs=matched_jobs,
+                run_metadata=run_metadata,
+                state=state,
+            )
+        else:
+            print()
+            print("[DRY RUN] Skipping SMTP email transmission.")
+            run_metadata["email_status"] = "dry_run"
+        t_email = round(time.time() - t3, 2)
+        run_metadata["latency_email_sec"] = t_email
 
     except Exception as exc:
         print(f"WORKFLOW EXCEPTION: {exc}")
@@ -1638,6 +1771,8 @@ def run_pipeline_once(
 
     finally:
         end_time = datetime.now(timezone.utc)
+        t_total = round((end_time - start_time).total_seconds(), 2)
+        run_metadata["latency_total_sec"] = t_total
         run_metadata["run_end_utc"] = end_time.isoformat()
         run_metadata["run_end_ist"] = format_ist_and_utc(end_time)
         state["last_run"] = run_metadata
@@ -1645,7 +1780,57 @@ def run_pipeline_once(
         # Atomic state persistence
         save_state(state)
 
+        # Production summary logging (Rule 12)
+        print_run_summary(run_metadata, start_time, end_time)
+
     return matched_jobs, run_metadata
+
+
+def print_run_summary(run_metadata: dict, start_time: datetime, end_time: datetime):
+    """
+    Format and print structured production execution logs per Rule 12.
+    """
+    print()
+    print("=" * 70)
+    print("JOB HUNTER RUN")
+    print("=" * 70)
+    print(f"Started: {start_time.isoformat()}")
+    print()
+    print("SOURCE RESULTS")
+    print(f"{'Source':<18} {'Status':<12} {'Details'}")
+    print("-" * 70)
+    for sid, stat in run_metadata.get("source_stats", {}).items():
+        name = stat.get("name", sid)
+        status = stat.get("status", "N/A")
+        raw = stat.get("raw", 0)
+        valid = stat.get("valid", 0)
+        elapsed = stat.get("elapsed", 0)
+        err = stat.get("error", "")
+        if err:
+            details = f"error: {err[:40]} ({elapsed}s)"
+        elif status in ("LIMITED", "UNAVAILABLE"):
+            details = f"requires auth / no open feed ({elapsed}s)"
+        else:
+            details = f"raw={raw:<3} valid={valid:<3} ({elapsed}s)"
+        print(f"{name:<18} {status:<12} {details}")
+
+    print()
+    print("FILTERING")
+    print(f"Discovered:        {run_metadata.get('jobs_retrieved', 0)}")
+    print(f"Fresh:             {run_metadata.get('jobs_within_freshness_window', 0)}")
+    print(f"Role matched:      {run_metadata.get('candidates_surviving_filter', 0)}")
+    print(f"Location matched:  {run_metadata.get('location_matched_jobs', run_metadata.get('candidates_surviving_filter', 0))}")
+    print(f"High-match (>=75): {run_metadata.get('high_match_jobs', 0)}")
+    print(f"High-priority:     {run_metadata.get('high_priority_jobs', 0)}")
+    print(f"Deduplicated:      {run_metadata.get('duplicates_skipped', 0)}")
+    print(f"Sent:              {run_metadata.get('emails_sent', 0)}")
+    print()
+    print("LATENCY")
+    print(f"Source retrieval:  {run_metadata.get('latency_retrieval_sec', 0)}s")
+    print(f"Matching:          {run_metadata.get('latency_matching_sec', 0)}s")
+    print(f"Email:             {run_metadata.get('latency_email_sec', 0)}s")
+    print(f"Total:             {run_metadata.get('latency_total_sec', 0)}s")
+    print("=" * 70)
 
 
 def run_worker_loop():
@@ -1684,22 +1869,6 @@ def main():
     print(f"Tracked jobs in database: {len(state.get('jobs', {}))}")
 
     matched_jobs, run_metadata = run_pipeline_once(state, force_all=True)
-
-    print()
-    print("=" * 70)
-    print("RUN EXECUTION SUMMARY")
-    print("=" * 70)
-    print(f"Start: {run_metadata['run_start_ist']}")
-    print(f"End:   {run_metadata['run_end_ist']}")
-    print(f"Provider: {run_metadata.get('scraper_provider', 'multi-source')}")
-    print(f"Scraped: {run_metadata['jobs_retrieved']}")
-    print(f"Fresh (< {FRESHNESS_WINDOW_MINUTES}m): {run_metadata['jobs_within_freshness_window']}")
-    print(f"Stale filtered: {run_metadata['stale_jobs_filtered']}")
-    print(f"Duplicates skipped: {run_metadata['duplicates_skipped']}")
-    print(f"High-match jobs: {run_metadata['high_match_jobs']}")
-    print(f"High-priority fresh jobs: {run_metadata.get('high_priority_jobs', 0)}")
-    print(f"Email Status: {run_metadata['email_status']}")
-    print("=" * 70)
 
 
 if __name__ == "__main__":

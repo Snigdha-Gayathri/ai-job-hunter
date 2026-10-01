@@ -48,6 +48,18 @@ AI_ROLE_KEYWORDS = {
     "ai software engineer",
     "junior ai engineer",
     "associate ai engineer",
+    "ai engineer intern",
+    "ml engineer intern",
+    "machine learning intern",
+    "genai engineer intern",
+    "genai intern",
+    "llm intern",
+    "genai/llm intern",
+    "agentic ai intern",
+    "applied ai intern",
+    "ai research intern",
+    "ai intern",
+    "ai/ml intern",
 }
 
 def sanitize_untrusted_text(text: str) -> str:
@@ -127,6 +139,11 @@ FRESHER_TERMS = {
     "0 to 1 years",
     "0 to 2 years",
     "new grad",
+    "intern",
+    "internship",
+    "trainee",
+    "student",
+    "apprentice",
 }
 
 
