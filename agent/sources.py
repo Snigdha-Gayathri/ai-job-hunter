@@ -232,6 +232,7 @@ def parse_rss_items(xml_text: str) -> list[dict]:
         )
         desc = get_tag("description") or get_tag("content:encoded")
         creator = get_tag("dc:creator") or get_tag("author")
+        location = get_tag("region") or get_tag("location")
 
         if title or link:
             items.append({
@@ -240,9 +241,11 @@ def parse_rss_items(xml_text: str) -> list[dict]:
                 "pubdate": pubdate,
                 "company": creator,
                 "description": desc,
+                "location": location,
             })
 
     return items
+
 
 
 # ============================================================
@@ -379,7 +382,7 @@ class RemoteOKSource(BaseSource):
         source_id = str(raw.get("id") or "").strip()
         title = str(raw.get("position") or "").strip()
         company = str(raw.get("company") or "").strip()
-        location = str(raw.get("location") or "Remote").strip()
+        location = str(raw.get("location") or "").strip()
         raw_url = str(raw.get("url") or "")
         canonical_url = normalize_url(raw_url)
         description = str(raw.get("description") or "")
@@ -439,7 +442,7 @@ class RemotiveSource(BaseSource):
         source_id = str(raw.get("id") or "").strip()
         title = str(raw.get("title") or "").strip()
         company = str(raw.get("company_name") or "").strip()
-        location = str(raw.get("candidate_required_location") or "Worldwide / Remote").strip()
+        location = str(raw.get("candidate_required_location") or raw.get("location") or "").strip()
         raw_url = str(raw.get("url") or "")
         canonical_url = normalize_url(raw_url)
         description = str(raw.get("description") or "")
@@ -498,7 +501,7 @@ class WorkingNomadsSource(BaseSource):
         source_id = str(raw.get("id") or "").strip()
         title = str(raw.get("title") or "").strip()
         company = str(raw.get("company_name") or "").strip()
-        location = str(raw.get("location_requirement") or "Remote").strip()
+        location = str(raw.get("location_requirement") or raw.get("location") or "").strip()
         raw_url = str(raw.get("url") or "")
         canonical_url = normalize_url(raw_url)
         description = str(raw.get("instructions") or raw.get("description") or "")
@@ -572,7 +575,7 @@ class WeWorkRemotelySource(BaseSource):
         return {
             "title": title,
             "company": company,
-            "location": "Remote",
+            "location": str(raw.get("location") or raw.get("region") or "Remote").strip(),
             "remote_type": "remote",
             "description": raw.get("description") or "",
             "url": canonical_url,
@@ -632,7 +635,7 @@ class NoDeskSource(BaseSource):
         return {
             "title": title,
             "company": company,
-            "location": "Remote",
+            "location": str(raw.get("location") or raw.get("region") or "Remote").strip(),
             "remote_type": "remote",
             "description": raw.get("description") or "",
             "url": canonical_url,
