@@ -235,21 +235,14 @@ TARGET_ROLE_FAMILIES = [
 ]
 
 TARGET_LOCATIONS = [
-    "hyderabad",
-    "bengaluru",
-    "bangalore",
     "mumbai",
+    "hyderabad",
+    "bangalore",
+    "bengaluru",
     "pune",
-    "delhi",
-    "gurgaon",
-    "noida",
-    "india",
     "remote",
-    "remote india",
-    "anywhere",
-    "worldwide",
-    "global",
 ]
+
 
 TARGET_EXPERIENCE_KEYWORDS = [
     "fresher",

@@ -378,19 +378,18 @@ def local_score_job(job: dict) -> dict:
         "remote" in location_str
         or "worldwide" in location_str
         or "anywhere" in location_str
-        or "global" in location_str
         or remote_type == "remote"
     )
-    is_india = any(
+    is_target_city = any(
         loc in location_str
-        for loc in ("india", "hyderabad", "bengaluru", "bangalore", "mumbai", "pune", "delhi", "noida", "gurgaon", "chennai")
+        for loc in ("hyderabad", "bengaluru", "bangalore", "mumbai", "pune")
     )
     is_foreign_onsite = any(
         c in location_str
         for c in ("united states", "usa", "uk", "london", "germany", "singapore", "canada", "australia")
-    ) and not is_remote and not is_india
+    ) and not is_remote and not is_target_city
 
-    if is_india or is_remote:
+    if is_target_city or is_remote:
         score += 10
         reasons.append("Target location or remote eligible")
     elif is_foreign_onsite:
@@ -398,6 +397,7 @@ def local_score_job(job: dict) -> dict:
         reasons.append("Non-India onsite location detected")
 
     score = max(0, min(score, 100))
+
 
     return {
         "local_score": score,

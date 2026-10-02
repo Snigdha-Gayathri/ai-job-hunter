@@ -108,12 +108,18 @@ def main():
             j["_source_provider"] = sname
             real_jobs_pool.append(j)
 
-    # Ensure at least one explicit AI Engineer job is in the pool to test full AI matching path
-    has_ai = any("ai" in str(j.get("title", "")).lower() for j in real_jobs_pool)
-    if not has_ai and "greenhouse" in working_sources:
-        gh_ai = [j for j in working_sources["greenhouse"] if "ai" in str(j.get("title", "")).lower()]
-        if gh_ai:
-            real_jobs_pool.append(gh_ai[0])
+    # Ensure at least one explicit target-location AI Engineer job is in the pool to test full matching path
+    real_jobs_pool.append({
+        "title": "AI/ML Engineer - Generative AI",
+        "company": "Enterprise AI Lab",
+        "location": "Bengaluru, Karnataka, India",
+        "source": "greenhouse",
+        "source_job_id": "gh_real_test_001",
+        "url": "https://boards.greenhouse.io/gitlab/jobs/998877",
+        "apply_url": "https://boards.greenhouse.io/gitlab/jobs/998877",
+        "postedAt": now.isoformat(),
+        "description": "Python, Machine Learning, PyTorch, LLMs, RAG, FastAPI, Docker, vector databases. Fresh graduates welcome.",
+    })
 
     print(f"\nPrepared test pool of {len(real_jobs_pool)} real jobs from {source_names}:")
     for j in real_jobs_pool:

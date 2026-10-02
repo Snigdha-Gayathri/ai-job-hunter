@@ -1,3 +1,4 @@
+import html
 import json
 import os
 import re
@@ -78,15 +79,219 @@ METRICS_FILE = STATE_DIR / "last_run_metrics.json"
 # Prevent the state file from growing forever
 MAX_SEEN_JOBS = 5000
 
-# Target Locations for Filter Validation
+# Target Locations for Strict Work-Location Filtering
 TARGET_LOCATIONS = [
-    "india",
-    "hyderabad",
-    "bengaluru",
-    "bangalore",
     "mumbai",
+    "hyderabad",
+    "bangalore",
+    "bengaluru",
+    "pune",
     "remote",
 ]
+
+TARGET_CITIES = [
+    "mumbai",
+    "bombay",
+    "hyderabad",
+    "secunderabad",
+    "bangalore",
+    "bengaluru",
+    "pune",
+]
+
+TARGET_CITY_RE = re.compile(
+    r"\b(" + "|".join(TARGET_CITIES) + r")\b",
+    re.IGNORECASE,
+)
+
+REMOTE_KEYWORD_RE = re.compile(
+    r"\b(remote|telecommute|wfh|worldwide|anywhere|work\s+from\s+home)\b",
+    re.IGNORECASE,
+)
+
+# Specific non-genuine remote phrases that must NEVER infer remote eligibility
+NON_GENUINE_REMOTE_RE = re.compile(
+    r"\b("
+    r"occasional(?:ly)?\s+remote|"
+    r"partial(?:ly)?\s+remote|"
+    r"remote[- ]friendly|"
+    r"remote\s+option(?:al)?|"
+    r"work\s+from\s+home\s+days|"
+    r"wfh\s+days|"
+    r"days?\s+(?:remote|wfh)|"
+    r"temporar(?:y|ily)\s+remote|"
+    r"hybrid\s*/\s*remote|"
+    r"remote\s*/\s*hybrid|"
+    r"hybrid\s+remote|"
+    r"remote\s+or\s+hybrid|"
+    r"hybrid"
+    r")\b",
+    re.IGNORECASE,
+)
+
+FOREIGN_RESTRICTION_RE = re.compile(
+    r"\b(us\s+only|usa\s+only|u\.s\.\s+only|united\s+states\s+only|uk\s+only|united\s+kingdom\s+only|"
+    r"europe\s+only|canada\s+only|australia\s+only|emea\s+only|latam\s+only|north\s+america\s+only|"
+    r"americas\s+only|germany\s+only|singapore\s+only|us\s+remote|remote\s+us|remote\s+usa|"
+    r"remote\s+[\(-]\s*us\b|remote\s+[\(-]\s*usa\b)\b",
+    re.IGNORECASE,
+)
+
+AMBIGUOUS_LOCATIONS = {
+    "", "none", "null", "unknown", "n/a", "na", "unspecified", "tbd",
+    "flexible", "multiple locations", "various", "undisclosed", "hybrid",
+    "onsite", "on-site", "india", "pan india", "any", "open", "global",
+}
+
+STRUCTURED_REMOTE_KEYWORDS = {
+    "remote", "telecommute", "wfh", "virtual", "work from home",
+}
+
+
+def is_valid_work_location(
+    job_or_location: dict | str | None,
+    workplace: str | None = None,
+) -> tuple[bool, str]:
+    """
+    STRICT WORK-LOCATION FILTER
+    Accepts ONLY jobs whose WORK LOCATION is one of:
+    1. Mumbai
+    2. Hyderabad
+    3. Bangalore / Bengaluru
+    4. Pune
+    5. Remote
+
+    The location must refer to where the candidate is expected to work, not company headquarters.
+    Do not infer remote eligibility merely from:
+    - presence of the word 'remote' in the job description
+    - a remote-job-board source
+    - 'occasional remote'
+    - 'hybrid'
+    - 'work from home days'
+    - 'remote-friendly'
+    If ambiguous, unavailable, or non-target, returns False rather than guessing.
+    """
+    if isinstance(job_or_location, dict):
+        loc = str(job_or_location.get("location") or "").strip()
+        wp = str(
+            job_or_location.get("workplace")
+            or job_or_location.get("workplaceType")
+            or workplace
+            or ""
+        ).strip()
+    else:
+        loc = str(job_or_location or "").strip()
+        wp = str(workplace or "").strip()
+
+    loc_lower = loc.lower()
+    wp_lower = wp.lower()
+
+    # 1. Check ambiguous / empty location
+    if not loc or loc_lower in AMBIGUOUS_LOCATIONS:
+        # If location is ambiguous/empty, only accept if structured workplace explicitly specifies remote
+        if wp_lower in STRUCTURED_REMOTE_KEYWORDS and loc_lower not in ("", "none", "null", "unknown", "n/a", "na"):
+            return True, "Remote work location matched via structured workplace"
+        return False, f"Missing or ambiguous location: '{loc}'"
+
+    # 2. Reject foreign-restricted remote locations (e.g. US Only, UK Only)
+    if FOREIGN_RESTRICTION_RE.search(loc_lower) and "india" not in loc_lower:
+        return False, f"Remote restricted to foreign region: '{loc}'"
+
+    # 3. Evaluate structured workplace semantics
+    is_structured_remote = (
+        wp_lower in STRUCTURED_REMOTE_KEYWORDS
+        or ("remote" in wp_lower and not NON_GENUINE_REMOTE_RE.search(wp_lower))
+    )
+    is_structured_hybrid = "hybrid" in wp_lower
+    is_structured_onsite = (
+        "onsite" in wp_lower or "on-site" in wp_lower or "office" in wp_lower
+    )
+
+    # Check if location string contains hybrid or non-genuine remote phrases
+    loc_has_non_genuine = bool(NON_GENUINE_REMOTE_RE.search(loc_lower))
+    loc_has_remote = bool(REMOTE_KEYWORD_RE.search(loc_lower))
+
+    # 4. Check target cities (Mumbai, Hyderabad, Bangalore/Bengaluru, Pune)
+    city_match = TARGET_CITY_RE.search(loc_lower)
+    if city_match:
+        target_city = city_match.group(1).capitalize()
+        # If the listing is marked as hybrid or contains non-genuine remote qualifiers:
+        # REJECT unless the listing explicitly identifies the role as remote-eligible (candidate can work remotely)
+        if is_structured_hybrid or loc_has_non_genuine:
+            if is_structured_remote:
+                return True, f"Target city {target_city} with explicit remote eligibility"
+            return False, f"Hybrid role in target city ({target_city}) not explicitly remote-eligible: '{loc}'"
+
+        # Standard target city listing
+        if is_structured_remote:
+            return True, f"Target city {target_city} (Remote-eligible)"
+        return True, f"Target city matched: {target_city}"
+
+    # 5. Check genuine remote work (when not in a target city)
+    # A job is accepted as remote ONLY when structured workplace or explicit location metadata
+    # indicates the candidate can actually work remotely, without conflicting hybrid/onsite semantics.
+    if is_structured_remote:
+        return True, "Remote work location matched via structured workplace"
+
+    # If structured workplace is explicitly hybrid or onsite, do not accept as remote
+    if is_structured_hybrid or is_structured_onsite:
+        return False, f"Workplace semantics specify {wp} (not remote) for non-target location: '{loc}'"
+
+    # Explicit location metadata indicating genuine remote:
+    # Must have remote keywords and MUST NOT have hybrid, occasional remote, remote-friendly, etc.
+    if loc_has_remote and not loc_has_non_genuine:
+        return True, "Remote work location matched via explicit metadata"
+
+    return False, f"Non-target location: '{loc}'"
+
+
+def filter_jobs_by_strict_location(
+    jobs: list[dict],
+    state: dict | None = None,
+    run_metadata: dict | None = None,
+) -> list[dict]:
+    """
+    Filters candidates by strict work-location requirement BEFORE Groq evaluation.
+    Only jobs in Mumbai, Hyderabad, Bangalore/Bengaluru, Pune, or Remote pass.
+    Rejected jobs are recorded in persistent state to avoid re-evaluation.
+    """
+    accepted = []
+    rejected_count = 0
+    seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
+
+    print()
+    print("=" * 70)
+    print("STRICT WORK-LOCATION FILTER (Mumbai, Hyderabad, Bangalore, Pune, Remote)")
+    print("=" * 70)
+
+    for job in jobs:
+        is_valid, reason = is_valid_work_location(job)
+        job_loc = job.get("location", "Unknown")
+        title = job.get("title", "Unknown")
+        comp = job.get("companyName") or job.get("company") or "Unknown"
+
+        if is_valid:
+            accepted.append(job)
+            print(f"  [ACCEPTED] {title} @ {comp} | Location: '{job_loc}' -> {reason}")
+        else:
+            rejected_count += 1
+            print(f"  [REJECTED] {title} @ {comp} | Location: '{job_loc}' -> {reason}")
+            jid = job.get("_job_id")
+            if jid and jid in seen_jobs:
+                seen_jobs[jid]["status"] = "rejected"
+                seen_jobs[jid]["reason"] = f"strict_location_rejected: {reason}"
+
+    print(
+        f"Location filter summary: {len(jobs)} input -> "
+        f"{len(accepted)} accepted -> {rejected_count} rejected"
+    )
+
+    if run_metadata is not None:
+        run_metadata["location_matched_jobs"] = len(accepted)
+        run_metadata["location_rejected_jobs"] = rejected_count
+
+    return accepted
+
 
 
 # ============================================================
@@ -1351,12 +1556,19 @@ def score_and_rank_jobs(
 ) -> list[dict]:
     """
     Two-stage matching pipeline:
-    1. Deterministic local relevance filter (AI/ML engineering profile)
-    2. Single Groq batch request (with local fallback)
+    1. Strict work-location filter (Mumbai, Hyderabad, Bangalore/Bengaluru, Pune, Remote)
+    2. Deterministic local relevance filter (AI/ML engineering profile)
+    3. Single Groq batch request (with local fallback)
     Records match outcomes and rejection states in state to prevent redundant Groq calls.
     """
     if not jobs:
         print("No jobs available for matching.")
+        return []
+
+    # 1. Enforce strict work-location filter BEFORE local pre-filter or Groq matching
+    jobs = filter_jobs_by_strict_location(jobs, state=state, run_metadata=run_metadata)
+    if not jobs:
+        print("No jobs passed the strict work-location filter.")
         return []
 
     print()
@@ -1366,6 +1578,7 @@ def score_and_rank_jobs(
 
     candidates = locally_filter_jobs(jobs)
     run_metadata["candidates_surviving_filter"] = len(candidates)
+
 
     seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
 
@@ -1436,8 +1649,334 @@ def score_and_rank_jobs(
 
 
 # ============================================================
-# EMAIL REPORTING WITH FRESHNESS & RUN METADATA
+# EMAIL DIGEST GENERATION & REPORTING
 # ============================================================
+
+def format_source_name(source: str | None) -> str:
+    """
+    Format concise, human-readable source names.
+    Examples: LinkedIn, Greenhouse, Ashby, Lever, Remote OK, Remotive, etc.
+    """
+    s = str(source or "").lower().strip()
+    sources_map = {
+        "linkedin": "LinkedIn",
+        "greenhouse": "Greenhouse",
+        "ashby": "Ashby",
+        "lever": "Lever",
+        "remoteok": "Remote OK",
+        "remotive": "Remotive",
+        "weworkremotely": "We Work Remotely",
+        "workingnomads": "Working Nomads",
+        "nodesk": "NoDesk",
+        "indeed": "Indeed",
+        "wellfound": "Wellfound",
+        "naukri": "Naukri",
+        "instahyre": "Instahyre",
+        "cutshort": "Cutshort",
+        "foundit": "Foundit",
+        "hirist": "Hirist",
+    }
+    return sources_map.get(s, s.title() if s else "Direct")
+
+
+def get_single_job_location_name(job: dict) -> str:
+    """
+    Extract a concise city or remote indicator for single-job email subject lines.
+    """
+    loc = str(job.get("location") or "").lower()
+    wp = str(
+        job.get("workplace")
+        or job.get("workplaceType")
+        or job.get("remote_type")
+        or ""
+    ).lower()
+    if "pune" in loc:
+        return "Pune"
+    if "mumbai" in loc or "bombay" in loc:
+        return "Mumbai"
+    if "hyderabad" in loc or "secunderabad" in loc:
+        return "Hyderabad"
+    if "bengaluru" in loc or "bangalore" in loc:
+        return "Bangalore"
+    if "remote" in loc or "remote" in wp:
+        return "Remote"
+    return "India"
+
+
+def extract_key_skills(job: dict) -> list[str]:
+    """
+    Extract clean, concise technical skill keywords for display.
+    """
+    skills = []
+    seen = set()
+
+    def add_skill(name: str):
+        name_clean = name.strip()
+        if not name_clean:
+            return
+        acronyms = {"ai", "ml", "llm", "llms", "rag", "nlp", "gpu", "mlops", "api"}
+        if name_clean.lower() in acronyms:
+            formatted = name_clean.upper() if name_clean.lower() != "llms" else "LLMs"
+        elif name_clean.lower() == "fastapi":
+            formatted = "FastAPI"
+        elif name_clean.lower() == "pytorch":
+            formatted = "PyTorch"
+        elif name_clean.lower() == "tensorflow":
+            formatted = "TensorFlow"
+        elif name_clean.lower() == "langchain":
+            formatted = "LangChain"
+        elif name_clean.lower() == "langgraph":
+            formatted = "LangGraph"
+        elif name_clean.lower() == "scikit-learn":
+            formatted = "scikit-learn"
+        else:
+            formatted = name_clean.title()
+
+        if formatted.lower() not in seen:
+            seen.add(formatted.lower())
+            skills.append(formatted)
+
+    # 1. From technical_matches
+    for tm in job.get("technical_matches") or []:
+        add_skill(tm)
+
+    # 2. From key_matches (if short keyword tokens)
+    for km in job.get("key_matches") or []:
+        km_clean = str(km).replace("+", "").strip()
+        if km_clean and len(km_clean.split()) <= 3:
+            add_skill(km_clean)
+
+    # 3. From text overlap with core AI/ML tech stack
+    text = (str(job.get("title") or "") + " " + str(job.get("description") or "")).lower()
+    core_techs = [
+        "Python", "Machine Learning", "PyTorch", "TensorFlow", "LLMs", "Generative AI",
+        "RAG", "FastAPI", "Docker", "Agentic AI", "LangChain", "Vector Databases",
+        "MLOps", "Qdrant", "Pinecone", "Deep Learning",
+    ]
+    for tech in core_techs:
+        if tech.lower() in text and tech.lower() not in seen:
+            add_skill(tech)
+
+    return skills[:8] if skills else ["Python", "Machine Learning", "LLMs", "FastAPI"]
+
+
+def format_why_it_matches(job: dict) -> str:
+    """
+    Produce a concise 1-2 sentence explanation of why the role matches.
+    Never outputs raw debug logs, code fences, or entire LLM reasoning blocks.
+    """
+    raw = job.get("match_reason") or job.get("reason") or ""
+    raw = re.sub(r"^(why it matches:?\s*)+", "", raw, flags=re.IGNORECASE).strip()
+    if not raw:
+        return "The role focuses on ML/AI development matching your AI/ML background and technical skills."
+
+    # Split into sentences and take first 1 or 2
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw) if s.strip()]
+    if len(sentences) >= 2:
+        short = f"{sentences[0]} {sentences[1]}"
+    elif sentences:
+        short = sentences[0]
+    else:
+        short = raw
+
+    if len(short) > 280:
+        short = short[:277].rsplit(" ", 1)[0] + "..."
+    return short
+
+
+def format_job_age(job: dict) -> str:
+    """
+    Format human-readable relative time (e.g. '39 minutes ago' or '1 hour ago').
+    """
+    raw_age = job.get("_latency_formatted") or ""
+    if not raw_age or "Unknown" in raw_age:
+        posted_dt = job.get("_posted_at_dt")
+        if posted_dt:
+            mins = max(0.0, (datetime.now(timezone.utc) - posted_dt).total_seconds() / 60.0)
+            if mins < 1:
+                return "< 1 minute ago"
+            elif mins < 60:
+                return f"{int(round(mins))} minutes ago"
+            elif mins < 1440:
+                hours = round(mins / 60.0, 1)
+                h_str = f"{int(hours)}" if hours.is_integer() else f"{hours}"
+                return f"{h_str} hour{'s' if hours != 1 else ''} ago"
+            else:
+                days = round(mins / 1440.0, 1)
+                d_str = f"{int(days)}" if days.is_integer() else f"{days}"
+                return f"{d_str} day{'s' if days != 1 else ''} ago"
+        return "recently"
+
+    if raw_age.lower().endswith("ago"):
+        return raw_age
+    if raw_age.startswith("<"):
+        return f"{raw_age} ago"
+    return f"{raw_age} ago"
+
+
+def build_email_digest(
+    jobs: list[dict],
+    now_utc: datetime | None = None,
+) -> tuple[str, str, str]:
+    """
+    Builds the clean Job Alert Digest email.
+    Returns: (subject, html_content, text_content)
+
+    Features:
+    - Clean card-based structure per job
+    - Shows ONLY: Title, Company, 📍 Location, 🕐 Posted, Source, Match score, Key skills, Why it matches, Apply button
+    - Single Apply button/link per job pointing directly to destination
+    - Zero tel: links, zero raw URLs, zero internal IDs, zero scraper/pipeline diagnostics
+    - No misleading fake 0/100 score breakdowns
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+
+    count = len(jobs)
+    if count == 1:
+        loc_name = get_single_job_location_name(jobs[0])
+        subject = f"AI Job Hunter | 1 New AI Match | {loc_name}"
+    else:
+        subject = f"AI Job Hunter | {count} New Matches | Mumbai · Hyderabad · Bangalore · Pune · Remote"
+
+    match_word = "match" if count == 1 else "matches"
+
+    cards_html = []
+    text_cards = []
+
+    for index, job in enumerate(jobs, start=1):
+        title = html.escape(str(job.get("title") or "Unknown Title"))
+        comp = html.escape(str(job.get("companyName") or job.get("company") or "Unknown Company"))
+        loc = html.escape(str(job.get("location") or "India"))
+        source_name = format_source_name(job.get("source"))
+        source_html = html.escape(source_name)
+        score = int(job.get("match_score", 0))
+        age_str = format_job_age(job)
+        why_matches = format_why_it_matches(job)
+        why_matches_html = html.escape(why_matches)
+        skills = extract_key_skills(job)
+        skills_str = " · ".join(skills)
+        skills_str_html = html.escape(skills_str)
+
+        apply_url = (
+            job.get("apply_url")
+            or job.get("applyUrl")
+            or job.get("url")
+            or job.get("_canonical_url")
+            or "#"
+        )
+        safe_apply_url = html.escape(apply_url)
+
+        # HTML Card
+        card_html = f"""    <div style="background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 22px 24px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.04);">
+      <div style="margin-bottom: 12px;">
+        <h2 style="margin: 0 0 4px 0; font-size: 18px; font-weight: 700; color: #0f172a; line-height: 1.3;">
+          {title}
+        </h2>
+        <div style="font-size: 15px; font-weight: 600; color: #334155;">
+          {comp}
+        </div>
+      </div>
+
+      <div style="font-size: 13px; color: #64748b; line-height: 1.6; margin-bottom: 14px;">
+        <div style="margin-bottom: 3px;">
+          <span style="color: #475569;">📍</span> {loc}
+        </div>
+        <div style="margin-bottom: 3px;">
+          <span style="color: #475569;">🕐</span> Posted {html.escape(age_str)}
+        </div>
+        <div style="margin-bottom: 3px;">
+          Source: <strong style="color: #334155;">{source_html}</strong>
+        </div>
+      </div>
+
+      <div style="margin-bottom: 14px;">
+        <span style="display: inline-block; background-color: #ecfdf5; color: #047857; font-weight: 700; font-size: 13px; padding: 4px 10px; border-radius: 6px; border: 1px solid #a7f3d0;">
+          Match: {score}/100
+        </span>
+      </div>
+
+      <div style="font-size: 13px; color: #334155; line-height: 1.5; margin-bottom: 14px;">
+        <strong>Key skills:</strong> {skills_str_html}
+      </div>
+
+      <div style="font-size: 13px; color: #475569; line-height: 1.5; margin-bottom: 18px; padding-left: 12px; border-left: 3px solid #cbd5e1;">
+        <strong style="color: #1e293b;">Why it matches:</strong><br>
+        {why_matches_html}
+      </div>
+
+      <div>
+        <a href="{safe_apply_url}" target="_blank" rel="noopener noreferrer" style="display: inline-block; background-color: #0f172a; color: #ffffff; text-decoration: none; font-size: 13px; font-weight: 600; padding: 10px 22px; border-radius: 6px; letter-spacing: 0.01em;">
+          Apply &rarr;
+        </a>
+      </div>
+    </div>"""
+        cards_html.append(card_html)
+
+        # Plain Text Card
+        text_card = f"""{job.get('title', 'Unknown Title')}
+{job.get('companyName') or job.get('company', 'Unknown Company')}
+
+📍 {job.get('location', 'India')}
+🕐 Posted {age_str}
+Source: {source_name}
+
+Match: {score}/100
+
+Key skills: {skills_str}
+
+Why it matches:
+{why_matches}
+
+[ Apply: {apply_url} ]"""
+        text_cards.append(text_card)
+
+    cards_joined = "\n\n".join(cards_html)
+    separator = "─" * 60
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="format-detection" content="telephone=no">
+  <title>{html.escape(subject)}</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased; color: #0f172a;">
+  <div style="max-width: 600px; margin: 0 auto; padding: 32px 16px;">
+    <div style="margin-bottom: 28px; text-align: left;">
+      <h1 style="margin: 0 0 6px 0; font-size: 22px; font-weight: 800; letter-spacing: -0.02em; color: #0f172a;">
+        AI JOB HUNTER
+      </h1>
+      <p style="margin: 0; font-size: 15px; color: #64748b; font-weight: 500;">
+        {count} new {match_word} matching your profile
+      </p>
+    </div>
+
+{cards_joined}
+
+    <div style="margin-top: 36px; padding-top: 20px; border-top: 1px solid #e2e8f0; text-align: center; color: #94a3b8; font-size: 13px; line-height: 1.6;">
+      <div style="font-weight: 600; color: #64748b; margin-bottom: 4px;">AI Job Hunter</div>
+      <div>Monitoring Mumbai &middot; Hyderabad &middot; Bangalore &middot; Pune &middot; Remote</div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+    text_content = f"""AI JOB HUNTER
+{count} new {match_word} for you
+
+{separator}
+
+""" + f"\n\n{separator}\n\n".join(text_cards) + f"""
+
+{separator}
+
+AI Job Hunter
+Monitoring Mumbai · Hyderabad · Bangalore · Pune · Remote"""
+
+    return subject, html_content, text_content
+
 
 def send_email_report(
     jobs: list[dict],
@@ -1445,15 +1984,24 @@ def send_email_report(
     state: dict,
 ):
     """
-    Send hourly job report via Gmail SMTP.
-    Features:
-    - Prominently displays Posted Time, Discovered Time, and Latency for every job
-    - Includes execution timeline & run metadata header
-    - Atomic status transition: sets status='emailed' only upon verified send;
+    Send clean Job Alert Digest via Gmail SMTP.
+    - Only sends if qualifying jobs exist
+    - Clean, human-readable HTML digest + plain text fallback
+    - Atomic status transition: sets status='emailed' upon success;
       sets status='email_failed' on error so jobs remain eligible for retry!
     """
     username = os.environ.get("GMAIL_USERNAME") or GMAIL_USERNAME
     app_password = os.environ.get("GMAIL_APP_PASSWORD") or GMAIL_APP_PASSWORD
+
+    now_utc = datetime.now(timezone.utc)
+    run_metadata["run_end_utc"] = now_utc.isoformat()
+    run_metadata["run_end_ist"] = format_ist_and_utc(now_utc)
+
+    if not jobs:
+        print("No matching jobs to send. Skipping email delivery.")
+        run_metadata["emails_sent"] = 0
+        run_metadata["email_status"] = "skipped_empty"
+        return
 
     if not username or not app_password:
         print(
@@ -1462,170 +2010,17 @@ def send_email_report(
         )
         return
 
-    now_utc = datetime.now(timezone.utc)
-    run_metadata["run_end_utc"] = now_utc.isoformat()
-    run_metadata["run_end_ist"] = format_ist_and_utc(now_utc)
+    subject, html_content, text_content = build_email_digest(
+        jobs[:MAX_EMAIL_JOBS],
+        now_utc=now_utc,
+    )
 
     message = EmailMessage()
     message["From"] = username
     message["To"] = username
-
-    has_high = any(j.get("priority") == "HIGH" for j in jobs[:MAX_EMAIL_JOBS])
-    count = len(jobs[:MAX_EMAIL_JOBS])
-    prefix = "🔥 [HIGH PRIORITY ALERT] " if has_high else ""
-    message["Subject"] = (
-        f"{prefix}AI Job Hunter - {count} High-Match Fresh Jobs "
-        f"[{format_ist_and_utc(now_utc)}]"
-    )
-
-    lines = [
-        "AI JOB HUNTER - MULTI-SOURCE FRESHNESS REPORT",
-        "=" * 70,
-        "",
-        "RUN METADATA:",
-        f"  Run Time: {format_ist_and_utc(now_utc)}",
-        f"  Scraper Provider: {run_metadata.get('scraper_provider', 'multi-source')}",
-        f"  Freshness Window: Last {FRESHNESS_WINDOW_MINUTES} minutes",
-        f"  Jobs Retrieved: {run_metadata.get('jobs_retrieved', 0)}",
-        (
-            f"  Within Freshness Window: "
-            f"{run_metadata.get('jobs_within_freshness_window', 0)}"
-        ),
-        f"  Stale Jobs Filtered: {run_metadata.get('stale_jobs_filtered', 0)}",
-        f"  Duplicates Skipped: {run_metadata.get('duplicates_skipped', 0)}",
-        f"  Email Retries: {run_metadata.get('email_retries', 0)}",
-        (
-            f"  AI Relevance Candidates: "
-            f"{run_metadata.get('candidates_surviving_filter', 0)}"
-        ),
-        (
-            f"  High-Match (>= {MIN_MATCH_SCORE}): "
-            f"{run_metadata.get('high_match_jobs', 0)}"
-        ),
-        (
-            f"  High-Priority Fresh Jobs: "
-            f"{run_metadata.get('high_priority_jobs', 0)}"
-        ),
-    ]
-
-    if run_metadata.get("scraper_errors"):
-        lines.append(
-            f"  Scraper Warnings: {run_metadata['scraper_errors']}"
-        )
-
-    lines.extend(["", "=" * 70, ""])
-
-    if not jobs:
-        lines.extend(
-            [
-                "No fresh jobs met the AI match threshold during this run.",
-                "",
-                "DIAGNOSIS:",
-                f"- Scraper ran: YES ({run_metadata.get('jobs_retrieved', 0)} jobs seen)",
-                (
-                    f"- Jobs within last {FRESHNESS_WINDOW_MINUTES} mins: "
-                    f"{run_metadata.get('jobs_within_freshness_window', 0)}"
-                ),
-                (
-                    f"- Stale jobs rejected: "
-                    f"{run_metadata.get('stale_jobs_filtered', 0)}"
-                ),
-                (
-                    f"- Previously processed jobs skipped: "
-                    f"{run_metadata.get('duplicates_skipped', 0)}"
-                ),
-                (
-                    f"- Candidates surviving local filter: "
-                    f"{run_metadata.get('candidates_surviving_filter', 0)}"
-                ),
-                "",
-                "Next scheduled scan will execute automatically.",
-                "",
-                "=" * 70,
-            ]
-        )
-    else:
-        for index, job in enumerate(jobs[:MAX_EMAIL_JOBS], start=1):
-            title = job.get("title", "Unknown Title")
-            company = (
-                job.get("companyName")
-                or job.get("company")
-                or "Unknown Company"
-            )
-            location = job.get("location", "India")
-            source = str(job.get("source") or "linkedin").upper()
-            priority = job.get("priority", "MEDIUM")
-            job_id = job.get("_job_id", "N/A")
-            canonical_url = job.get("_canonical_url", "")
-            apply_url = (
-                job.get("applyUrl")
-                or job.get("apply_url")
-                or canonical_url
-                or "No link available"
-            )
-
-            posted_dt = job.get("_posted_at_dt")
-            posted_str = format_ist_and_utc(posted_dt)
-            discovered_dt = job.get(
-                "_scraper_discovered_at",
-                now_utc,
-            )
-            discovered_str = format_ist_and_utc(discovered_dt)
-            age_str = job.get(
-                "_latency_formatted",
-                "Unknown",
-            )
-
-            score = job.get("match_score", 0)
-            qualification = job.get(
-                "qualification",
-                "MODERATE_MATCH",
-            )
-            exp_fit = job.get("experience_fit", "MODERATE")
-            tech_fit = job.get("technical_fit", 0)
-            role_fit = job.get("role_fit", 0)
-            reason = job.get("match_reason", "")
-            key_matches = job.get("key_matches", [])
-            concerns = job.get("concerns", [])
-
-            lines.extend(
-                [
-                    f"{index}. {title} [{priority} PRIORITY]",
-                    f"   Company: {company}",
-                    f"   Source: {source}",
-                    f"   Location: {location}",
-                    "",
-                    f"   Posted: {posted_str}",
-                    f"   Discovered: {discovered_str}",
-                    f"   Detection Latency: {age_str}",
-                    f"   Job ID: {job_id}",
-                    "",
-                    f"   AI MATCH SCORE: {score}/100 ({qualification})",
-                    (
-                        f"   Fit Breakdown: Tech {tech_fit}/100 | "
-                        f"Role {role_fit}/100 | Experience: {exp_fit}"
-                    ),
-                    "",
-                    f"   Apply: {apply_url}",
-                    f"   URL: {canonical_url}",
-                    "",
-                    f"   WHY IT MATCHES: {reason}",
-                ]
-            )
-
-            if key_matches:
-                lines.append("   KEY MATCHES:")
-                for km in key_matches:
-                    lines.append(f"     + {km}")
-
-            if concerns:
-                lines.append("   NOTES / CONCERNS:")
-                for c in concerns:
-                    lines.append(f"     ! {c}")
-
-            lines.extend(["", "-" * 70, ""])
-
-    message.set_content("\n".join(lines))
+    message["Subject"] = subject
+    message.set_content(text_content)
+    message.add_alternative(html_content, subtype="html")
 
     print()
     print("Connecting to Gmail SMTP (smtp.gmail.com:465)...")
@@ -1672,6 +2067,7 @@ def send_email_report(
                     seen_jobs[jid].get("email_attempts", 0) + 1
                 )
         raise
+
 
 
 # ============================================================
@@ -1735,18 +2131,29 @@ def run_pipeline_once(
         t_dedup = round(time.time() - t1, 2)
         run_metadata["latency_dedup_sec"] = t_dedup
 
-        # 3. Local Relevance + AI Batch Matching
+        # 3. Strict Work-Location Filter (Mumbai, Hyderabad, Bangalore, Pune, Remote)
+        t_loc = time.time()
+        location_matched_jobs = filter_jobs_by_strict_location(
+            eligible_jobs,
+            state=state,
+            run_metadata=run_metadata,
+        )
+        t_loc_sec = round(time.time() - t_loc, 2)
+        run_metadata["latency_location_sec"] = t_loc_sec
+
+        # 4. Local Relevance Prefilter + Groq Batch Matching
         t2 = time.time()
         matched_jobs = score_and_rank_jobs(
-            eligible_jobs,
+            location_matched_jobs,
             run_metadata,
             state=state,
         )
         t_matching = round(time.time() - t2, 2)
         run_metadata["latency_matching_sec"] = t_matching
 
-        # 4. Email Notification
+        # 5. Email Notification
         t3 = time.time()
+
         dry_run = "--dry-run" in sys.argv or os.environ.get("DRY_RUN", "false").lower() == "true"
         if not dry_run:
             print()
