@@ -10,6 +10,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 import sys
+import traceback
 import requests
 
 if sys.platform == "win32":
@@ -22,6 +23,7 @@ from job_matcher import (
     locally_filter_jobs,
     score_jobs_batch,
     classify_priority,
+    local_score_job,
 )
 from sources import (
     SourceRegistry,
@@ -29,12 +31,23 @@ from sources import (
 )
 from config import (
     SOURCES_CONFIG,
+    EXCLUDED_COMPANIES,
+    GROQ_BATCH_SIZE,
+    MIN_MATCH_SCORE,
+    MAX_EMAIL_SAFETY_CEILING,
+    MAX_SCRAPED_JOBS,
     HIGH_PRIORITY_SCORE,
     FRESHNESS_WINDOW_MINUTES,
     FRESHNESS_WINDOW_HOURS,
     HIGH_PRIORITY_MAX_AGE_MINUTES,
     TARGET_LOCATIONS as CONFIG_TARGET_LOCATIONS,
     TARGET_ROLE_FAMILIES,
+)
+from filters import (
+    is_company_excluded,
+    evaluate_experience_eligibility,
+    is_valid_work_location,
+    is_role_relevant,
 )
 
 
@@ -61,14 +74,11 @@ APIFY_URL = (
     f"{ACTOR_ID}/run-sync-get-dataset-items"
 )
 
-# Freshness Configuration:
-# Configured via FRESHNESS_WINDOW_MINUTES (default: 48 hours for active postings)
-# High-priority alert window: posted within last 3 hours (180 mins)
-
-# Limits
-MAX_EMAIL_JOBS = 20
-MAX_SCRAPED_JOBS = 50
-MIN_MATCH_SCORE = 75
+# Limits & Batching (No arbitrary truncation)
+# Send ALL qualifying jobs. MAX_EMAIL_SAFETY_CEILING is only an extreme runaway ceiling.
+MAX_EMAIL_SAFETY_CEILING = int(os.environ.get("MAX_EMAIL_SAFETY_CEILING", "200"))
+MAX_SCRAPED_JOBS = int(os.environ.get("MAX_SCRAPED_JOBS", "300"))
+MIN_MATCH_SCORE = int(os.environ.get("MIN_MATCH_SCORE", "50"))
 
 # Persistent state management
 BASE_DIR = Path(__file__).resolve().parent
@@ -79,170 +89,98 @@ METRICS_FILE = STATE_DIR / "last_run_metrics.json"
 # Prevent the state file from growing forever
 MAX_SEEN_JOBS = 5000
 
-# Target Locations for Strict Work-Location Filtering
-TARGET_LOCATIONS = [
-    "mumbai",
-    "hyderabad",
-    "bangalore",
-    "bengaluru",
-    "pune",
-    "remote",
-]
 
-TARGET_CITIES = [
-    "mumbai",
-    "bombay",
-    "hyderabad",
-    "secunderabad",
-    "bangalore",
-    "bengaluru",
-    "pune",
-]
+# ============================================================
+# DETERMINISTIC HARD FILTERS (BEFORE GROQ)
+# ============================================================
 
-TARGET_CITY_RE = re.compile(
-    r"\b(" + "|".join(TARGET_CITIES) + r")\b",
-    re.IGNORECASE,
-)
-
-REMOTE_KEYWORD_RE = re.compile(
-    r"\b(remote|telecommute|wfh|worldwide|anywhere|work\s+from\s+home)\b",
-    re.IGNORECASE,
-)
-
-# Specific non-genuine remote phrases that must NEVER infer remote eligibility
-NON_GENUINE_REMOTE_RE = re.compile(
-    r"\b("
-    r"occasional(?:ly)?\s+remote|"
-    r"partial(?:ly)?\s+remote|"
-    r"remote[- ]friendly|"
-    r"remote\s+option(?:al)?|"
-    r"work\s+from\s+home\s+days|"
-    r"wfh\s+days|"
-    r"days?\s+(?:remote|wfh)|"
-    r"temporar(?:y|ily)\s+remote|"
-    r"hybrid\s*/\s*remote|"
-    r"remote\s*/\s*hybrid|"
-    r"hybrid\s+remote|"
-    r"remote\s+or\s+hybrid|"
-    r"hybrid"
-    r")\b",
-    re.IGNORECASE,
-)
-
-FOREIGN_RESTRICTION_RE = re.compile(
-    r"\b(us\s+only|usa\s+only|u\.s\.\s+only|united\s+states\s+only|uk\s+only|united\s+kingdom\s+only|"
-    r"europe\s+only|canada\s+only|australia\s+only|emea\s+only|latam\s+only|north\s+america\s+only|"
-    r"americas\s+only|germany\s+only|singapore\s+only|us\s+remote|remote\s+us|remote\s+usa|"
-    r"remote\s+[\(-]\s*us\b|remote\s+[\(-]\s*usa\b)\b",
-    re.IGNORECASE,
-)
-
-AMBIGUOUS_LOCATIONS = {
-    "", "none", "null", "unknown", "n/a", "na", "unspecified", "tbd",
-    "flexible", "multiple locations", "various", "undisclosed", "hybrid",
-    "onsite", "on-site", "india", "pan india", "any", "open", "global",
-}
-
-STRUCTURED_REMOTE_KEYWORDS = {
-    "remote", "telecommute", "wfh", "virtual", "work from home",
-}
-
-
-def is_valid_work_location(
-    job_or_location: dict | str | None,
-    workplace: str | None = None,
-) -> tuple[bool, str]:
+def filter_jobs_by_company(
+    jobs: list[dict],
+    state: dict | None = None,
+    run_metadata: dict | None = None,
+) -> list[dict]:
     """
-    STRICT WORK-LOCATION FILTER
-    Accepts ONLY jobs whose WORK LOCATION is one of:
-    1. Mumbai
-    2. Hyderabad
-    3. Bangalore / Bengaluru
-    4. Pune
-    5. Remote
-
-    The location must refer to where the candidate is expected to work, not company headquarters.
-    Do not infer remote eligibility merely from:
-    - presence of the word 'remote' in the job description
-    - a remote-job-board source
-    - 'occasional remote'
-    - 'hybrid'
-    - 'work from home days'
-    - 'remote-friendly'
-    If ambiguous, unavailable, or non-target, returns False rather than guessing.
+    Hard Company Exclusion Filter:
+    Eliminates Infosys, Infosys Limited, Infosys BPM, and subsidiaries BEFORE Groq.
     """
-    if isinstance(job_or_location, dict):
-        loc = str(job_or_location.get("location") or "").strip()
-        wp = str(
-            job_or_location.get("workplace")
-            or job_or_location.get("workplaceType")
-            or workplace
-            or ""
-        ).strip()
-    else:
-        loc = str(job_or_location or "").strip()
-        wp = str(workplace or "").strip()
+    accepted = []
+    rejected_count = 0
+    seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
 
-    loc_lower = loc.lower()
-    wp_lower = wp.lower()
+    print()
+    print("=" * 70)
+    print("EXCLUDED COMPANY FILTER (Infosys and variants)")
+    print("=" * 70)
 
-    # 1. Check ambiguous / empty location
-    if not loc or loc_lower in AMBIGUOUS_LOCATIONS:
-        # If location is ambiguous/empty, only accept if structured workplace explicitly specifies remote
-        if wp_lower in STRUCTURED_REMOTE_KEYWORDS and loc_lower not in ("", "none", "null", "unknown", "n/a", "na"):
-            return True, "Remote work location matched via structured workplace"
-        return False, f"Missing or ambiguous location: '{loc}'"
+    for job in jobs:
+        comp = job.get("companyName") or job.get("company") or ""
+        is_exc, reason = is_company_excluded(comp)
+        jid = job.get("_job_id")
+        title = job.get("title", "Unknown")
 
-    # 2. Reject foreign-restricted remote locations (e.g. US Only, UK Only)
-    if FOREIGN_RESTRICTION_RE.search(loc_lower) and "india" not in loc_lower:
-        return False, f"Remote restricted to foreign region: '{loc}'"
+        if is_exc:
+            rejected_count += 1
+            print(f"  [REJECTED COMPANY] {title} @ '{comp}' -> {reason}")
+            if jid and jid in seen_jobs:
+                seen_jobs[jid]["status"] = "rejected"
+                seen_jobs[jid]["reason"] = f"company_excluded: {reason}"
+        else:
+            accepted.append(job)
 
-    # 3. Evaluate structured workplace semantics
-    is_structured_remote = (
-        wp_lower in STRUCTURED_REMOTE_KEYWORDS
-        or ("remote" in wp_lower and not NON_GENUINE_REMOTE_RE.search(wp_lower))
+    print(
+        f"Company filter summary: {len(jobs)} input -> "
+        f"{len(accepted)} accepted -> {rejected_count} rejected"
     )
-    is_structured_hybrid = "hybrid" in wp_lower
-    is_structured_onsite = (
-        "onsite" in wp_lower or "on-site" in wp_lower or "office" in wp_lower
+    if run_metadata is not None:
+        run_metadata["company_matched_jobs"] = len(accepted)
+        run_metadata["company_rejected_jobs"] = rejected_count
+
+    return accepted
+
+
+def filter_jobs_by_experience(
+    jobs: list[dict],
+    state: dict | None = None,
+    run_metadata: dict | None = None,
+) -> list[dict]:
+    """
+    Deterministic Experience Filter:
+    Accepts: fresher, 0-1, 0-2, 1-2 YOE, entry-level, intern, trainee.
+    Rejects: 3+, 4+, 5+, 7+, 8+ YOE, Senior, Lead, Principal, Architect BEFORE Groq.
+    """
+    accepted = []
+    rejected_count = 0
+    seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
+
+    print()
+    print("=" * 70)
+    print("EXPERIENCE FILTER (Fresher / Entry-Level / 0-2 YOE only)")
+    print("=" * 70)
+
+    for job in jobs:
+        is_elig, reason = evaluate_experience_eligibility(job)
+        jid = job.get("_job_id")
+        title = job.get("title", "Unknown")
+        comp = job.get("companyName") or job.get("company") or "Unknown"
+
+        if is_elig:
+            accepted.append(job)
+        else:
+            rejected_count += 1
+            print(f"  [REJECTED EXPERIENCE] {title} @ {comp} -> {reason}")
+            if jid and jid in seen_jobs:
+                seen_jobs[jid]["status"] = "rejected"
+                seen_jobs[jid]["reason"] = f"experience_too_high: {reason}"
+
+    print(
+        f"Experience filter summary: {len(jobs)} input -> "
+        f"{len(accepted)} accepted -> {rejected_count} rejected"
     )
+    if run_metadata is not None:
+        run_metadata["experience_matched_jobs"] = len(accepted)
+        run_metadata["experience_rejected_jobs"] = rejected_count
 
-    # Check if location string contains hybrid or non-genuine remote phrases
-    loc_has_non_genuine = bool(NON_GENUINE_REMOTE_RE.search(loc_lower))
-    loc_has_remote = bool(REMOTE_KEYWORD_RE.search(loc_lower))
-
-    # 4. Check target cities (Mumbai, Hyderabad, Bangalore/Bengaluru, Pune)
-    city_match = TARGET_CITY_RE.search(loc_lower)
-    if city_match:
-        target_city = city_match.group(1).capitalize()
-        # If the listing is marked as hybrid or contains non-genuine remote qualifiers:
-        # REJECT unless the listing explicitly identifies the role as remote-eligible (candidate can work remotely)
-        if is_structured_hybrid or loc_has_non_genuine:
-            if is_structured_remote:
-                return True, f"Target city {target_city} with explicit remote eligibility"
-            return False, f"Hybrid role in target city ({target_city}) not explicitly remote-eligible: '{loc}'"
-
-        # Standard target city listing
-        if is_structured_remote:
-            return True, f"Target city {target_city} (Remote-eligible)"
-        return True, f"Target city matched: {target_city}"
-
-    # 5. Check genuine remote work (when not in a target city)
-    # A job is accepted as remote ONLY when structured workplace or explicit location metadata
-    # indicates the candidate can actually work remotely, without conflicting hybrid/onsite semantics.
-    if is_structured_remote:
-        return True, "Remote work location matched via structured workplace"
-
-    # If structured workplace is explicitly hybrid or onsite, do not accept as remote
-    if is_structured_hybrid or is_structured_onsite:
-        return False, f"Workplace semantics specify {wp} (not remote) for non-target location: '{loc}'"
-
-    # Explicit location metadata indicating genuine remote:
-    # Must have remote keywords and MUST NOT have hybrid, occasional remote, remote-friendly, etc.
-    if loc_has_remote and not loc_has_non_genuine:
-        return True, "Remote work location matched via explicit metadata"
-
-    return False, f"Non-target location: '{loc}'"
+    return accepted
 
 
 def filter_jobs_by_strict_location(
@@ -251,9 +189,8 @@ def filter_jobs_by_strict_location(
     run_metadata: dict | None = None,
 ) -> list[dict]:
     """
-    Filters candidates by strict work-location requirement BEFORE Groq evaluation.
-    Only jobs in Mumbai, Hyderabad, Bangalore/Bengaluru, Pune, or Remote pass.
-    Rejected jobs are recorded in persistent state to avoid re-evaluation.
+    Strict Work-Location Filter:
+    Accepts ONLY jobs in Mumbai, Hyderabad, Bangalore/Bengaluru, Pune, or Remote.
     """
     accepted = []
     rejected_count = 0
@@ -275,7 +212,7 @@ def filter_jobs_by_strict_location(
             print(f"  [ACCEPTED] {title} @ {comp} | Location: '{job_loc}' -> {reason}")
         else:
             rejected_count += 1
-            print(f"  [REJECTED] {title} @ {comp} | Location: '{job_loc}' -> {reason}")
+            print(f"  [REJECTED LOCATION] {title} @ {comp} | Location: '{job_loc}' -> {reason}")
             jid = job.get("_job_id")
             if jid and jid in seen_jobs:
                 seen_jobs[jid]["status"] = "rejected"
@@ -285,10 +222,58 @@ def filter_jobs_by_strict_location(
         f"Location filter summary: {len(jobs)} input -> "
         f"{len(accepted)} accepted -> {rejected_count} rejected"
     )
-
     if run_metadata is not None:
         run_metadata["location_matched_jobs"] = len(accepted)
         run_metadata["location_rejected_jobs"] = rejected_count
+
+    return accepted
+
+
+def filter_jobs_by_role(
+    jobs: list[dict],
+    state: dict | None = None,
+    run_metadata: dict | None = None,
+) -> list[dict]:
+    """
+    Role Relevance Filter:
+    Matches all target AI/ML, GenAI, LLM, Agentic, Applied AI, CV, NLP roles.
+    Rejects clearly unrelated non-AI roles (Frontend, Java, QA, DevOps, etc.).
+    """
+    accepted = []
+    rejected_count = 0
+    seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
+
+    print()
+    print("=" * 70)
+    print("ROLE RELEVANCE FILTER (AI/ML/GenAI/LLM/Agentic/Applied AI)")
+    print("=" * 70)
+
+    for job in jobs:
+        title = job.get("title", "")
+        desc = job.get("description") or job.get("descriptionHtml") or ""
+        is_rel, reason = is_role_relevant(title, desc)
+        jid = job.get("_job_id")
+        comp = job.get("companyName") or job.get("company") or "Unknown"
+
+        if is_rel:
+            accepted.append(job)
+        else:
+            rejected_count += 1
+            source = job.get("source") or job.get("_source_provider") or "unknown"
+            if run_metadata is not None:
+                run_metadata.setdefault("rejected_titles_by_role", {}).setdefault(source, []).append(title)
+            print(f"  [REJECTED ROLE] {title} @ {comp} -> {reason}")
+            if jid and jid in seen_jobs:
+                seen_jobs[jid]["status"] = "rejected"
+                seen_jobs[jid]["reason"] = f"role_not_relevant: {reason}"
+
+    print(
+        f"Role filter summary: {len(jobs)} input -> "
+        f"{len(accepted)} accepted -> {rejected_count} rejected"
+    )
+    if run_metadata is not None:
+        run_metadata["role_matched_jobs"] = len(accepted)
+        run_metadata["role_rejected_jobs"] = rejected_count
 
     return accepted
 
@@ -1034,14 +1019,14 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
     print("=" * 80)
 
     if not APIFY_TOKEN:
-        err = "APIFY_API_TOKEN is missing or not set in environment."
+        err = "APIFY_API_TOKEN is missing or not set in environment. LinkedIn acquisition could not be live-tested because APIFY_API_TOKEN is unavailable locally."
         print(f"ERROR: {err}")
         run_metadata["scraper_errors"].append(err)
         return []
 
     params = {"token": APIFY_TOKEN}
 
-    # Exact production search configuration
+    # Targeted multi-partition production search configuration across required cities & AI role families
     payload = {
         "searchQuery": "AI Engineer",
         "searchQueries": [
@@ -1050,8 +1035,34 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
             "Generative AI Engineer",
             "LLM Engineer",
             "Agentic AI Engineer",
+            "AI/ML Engineer",
+            "Applied AI Engineer",
+            "AI Developer",
+            "AI Intern",
+            "Machine Learning Intern",
+        ],
+        "keywords": [
+            "AI Engineer",
+            "Machine Learning Engineer",
+            "Generative AI Engineer",
+            "LLM Engineer",
+            "Agentic AI Engineer",
+            "AI/ML Engineer",
+            "Applied AI Engineer",
+            "AI Developer",
+            "AI Intern",
+            "Machine Learning Intern",
+        ],
+        "locations": [
+            "Mumbai",
+            "Hyderabad",
+            "Bangalore",
+            "Bengaluru",
+            "Pune",
+            "Remote",
         ],
         "location": "India",
+        "maxItems": MAX_SCRAPED_JOBS,
         "maxJobs": MAX_SCRAPED_JOBS,
         "jobType": "F",
         "experienceLevel": "2",  # Entry level
@@ -1059,25 +1070,33 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
         "sortBy": "DD",  # Most Recent
         "scrapeJobDetails": True,
         "startUrls": [
-            {
-                "url": (
-                    "https://www.linkedin.com/jobs/search/?"
-                    "keywords=AI+Engineer&location=India&f_TPR=r7200&sortBy=DD"
-                )
-            },
-            {
-                "url": (
-                    "https://www.linkedin.com/jobs/search/?"
-                    "keywords=Machine+Learning+Engineer&location=India&f_TPR=r7200&sortBy=DD"
-                )
-            },
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Engineer&location=Bengaluru&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Engineer&location=Bengaluru&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Generative+AI+Engineer&location=Bengaluru&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=LLM+Engineer&location=Bengaluru&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Engineer&location=Hyderabad&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Engineer&location=Hyderabad&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Generative+AI+Engineer&location=Hyderabad&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Engineer&location=Pune&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Engineer&location=Pune&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Generative+AI+Engineer&location=Pune&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Engineer&location=Mumbai&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Engineer&location=Mumbai&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Generative+AI+Engineer&location=Mumbai&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Engineer&location=India&f_WT=2&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Engineer&location=India&f_WT=2&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Generative+AI+Engineer&location=India&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=LLM+Engineer&location=India&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Agentic+AI+Engineer&location=India&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Intern&location=India&f_TPR=r86400&sortBy=DD"},
+            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Intern&location=India&f_TPR=r86400&sortBy=DD"},
         ],
     }
 
     print("Search Configuration:")
     print("  sortBy:        'DD' (Most Recent)")
     print("  datePosted:    'r86400' (Past 24 hours)")
-    print("  startUrls:     2 URLs with f_TPR='r7200' (Past 2 hours) and sortBy='DD'")
+    print(f"  startUrls:     {len(payload['startUrls'])} multi-partition URLs (Mumbai, Hyd, Blr, Pune, Remote)")
     print(f"  searchQueries: {payload['searchQueries']}")
 
     # --------------------------------------------------------
@@ -1398,11 +1417,10 @@ def process_jobs_freshness_and_state(
             job_id = existing_id
             job["_job_id"] = existing_id
 
-        # If already finalized (emailed, rejected, stale, email_abandoned): skip!
+        # If already finalized (emailed, rejected, email_abandoned): skip!
         if existing_record and existing_record.get("status") in (
             "emailed",
             "rejected",
-            "stale",
             "email_abandoned",
         ):
             run_metadata["duplicates_skipped"] += 1
@@ -1424,47 +1442,21 @@ def process_jobs_freshness_and_state(
                 )
                 continue
 
-        # 3. Check for stale jobs
-        if not freshness["is_fresh"]:
+        # Check for truly obsolete listings (older than 14 days)
+        max_age_days = int(os.environ.get("MAX_JOB_AGE_DAYS", "14"))
+        latency_mins = freshness.get("discovery_latency_minutes")
+        if latency_mins is not None and latency_mins > (max_age_days * 1440):
             run_metadata["stale_jobs_filtered"] += 1
             print(
-                f"[STALE FILTERED] '{job.get('title')}' at "
+                f"[EXPIRED LISTING] '{job.get('title')}' at "
                 f"'{job.get('companyName') or job.get('company')}' - "
-                f"{freshness['freshness_reason']}"
+                f"posted {round(latency_mins / 1440, 1)} days ago (exceeds {max_age_days}d limit)"
             )
-
-            # Record in state as stale so we don't re-log or re-evaluate it
-            if job_id not in seen_jobs:
-                seen_jobs[job_id] = {
-                    "job_id": job_id,
-                    "source_job_id": job.get("source_job_id") or job_id,
-                    "title": str(job.get("title") or ""),
-                    "company": str(
-                        job.get("companyName")
-                        or job.get("company")
-                        or ""
-                    ),
-                    "url": canonical_url,
-                    "source": source_name,
-                    "seen_sources": [source_name],
-                    "first_seen": discovered_at.isoformat(),
-                    "first_seen_at": discovered_at.isoformat(),
-                    "last_seen": discovered_at.isoformat(),
-                    "posted_at": freshness["posted_at_iso"],
-                    "source_posted_at": freshness["posted_at_iso"],
-                    "discovery_latency_minutes": freshness[
-                        "discovery_latency_minutes"
-                    ],
-                    "detection_latency_minutes": freshness[
-                        "discovery_latency_minutes"
-                    ],
-                    "status": "stale",
-                    "reason": freshness["freshness_reason"],
-                }
             continue
 
-        # Job is within freshness window!
-        run_metadata["jobs_within_freshness_window"] += 1
+        # Job is eligible for evaluation!
+        if freshness["is_fresh"]:
+            run_metadata["jobs_within_freshness_window"] += 1
 
         # 4. Handle Retry vs New Discovery
         if existing_record and existing_record.get("status") in (
@@ -1555,44 +1547,18 @@ def score_and_rank_jobs(
     state: dict | None = None,
 ) -> list[dict]:
     """
-    Two-stage matching pipeline:
-    1. Strict work-location filter (Mumbai, Hyderabad, Bangalore/Bengaluru, Pune, Remote)
-    2. Deterministic local relevance filter (AI/ML engineering profile)
-    3. Single Groq batch request (with local fallback)
+    Batched AI/Groq matching (or deterministic local fallback).
+    Evaluates ALL candidate jobs in batches of GROQ_BATCH_SIZE (15) without truncation.
+    Filters by MIN_MATCH_SCORE (50) floor.
     Records match outcomes and rejection states in state to prevent redundant Groq calls.
     """
     if not jobs:
         print("No jobs available for matching.")
         return []
 
-    # 1. Enforce strict work-location filter BEFORE local pre-filter or Groq matching
-    jobs = filter_jobs_by_strict_location(jobs, state=state, run_metadata=run_metadata)
-    if not jobs:
-        print("No jobs passed the strict work-location filter.")
-        return []
-
-    print()
-    print("=" * 70)
-    print("LOCAL JOB RELEVANCE FILTER")
-    print("=" * 70)
-
-    candidates = locally_filter_jobs(jobs)
+    candidates = jobs
     run_metadata["candidates_surviving_filter"] = len(candidates)
-
-
     seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
-
-    # Record jobs that failed local pre-filter as rejected so they are never evaluated again
-    candidate_ids = {c.get("_job_id") for c in candidates if c.get("_job_id")}
-    for job in jobs:
-        jid = job.get("_job_id")
-        if jid and jid not in candidate_ids and jid in seen_jobs:
-            seen_jobs[jid]["status"] = "rejected"
-            seen_jobs[jid]["reason"] = "local_prefilter_rejected"
-
-    if not candidates:
-        print("No jobs passed the local AI/ML filter.")
-        return []
 
     # Separate candidates: new un-scored vs previously evaluated retries
     unscored_candidates = [j for j in candidates if not j.get("_already_scored")]
@@ -1602,7 +1568,7 @@ def score_and_rank_jobs(
     if unscored_candidates:
         print()
         print("=" * 70)
-        print("AI BATCH MATCHING (GROQ / LOCAL FALLBACK)")
+        print(f"AI BATCH MATCHING (GROQ / LOCAL FALLBACK) - {len(unscored_candidates)} candidates")
         print("=" * 70)
 
         scored_new = score_jobs_batch(unscored_candidates)
@@ -1618,6 +1584,7 @@ def score_and_rank_jobs(
                     seen_jobs[jid]["reason"] = j.get("reason", "")
                     if score < MIN_MATCH_SCORE:
                         seen_jobs[jid]["status"] = "rejected"
+                        seen_jobs[jid]["reason"] = f"score_below_threshold: {score} < {MIN_MATCH_SCORE}"
 
     all_scored = already_scored_candidates + scored_new
     if not all_scored:
@@ -1987,6 +1954,8 @@ def send_email_report(
     Send clean Job Alert Digest via Gmail SMTP.
     - Only sends if qualifying jobs exist
     - Clean, human-readable HTML digest + plain text fallback
+    - Sends ALL qualifying jobs without arbitrary truncation
+      (MAX_EMAIL_SAFETY_CEILING is only an extreme runaway ceiling)
     - Atomic status transition: sets status='emailed' upon success;
       sets status='email_failed' on error so jobs remain eligible for retry!
     """
@@ -2010,8 +1979,17 @@ def send_email_report(
         )
         return
 
+    if len(jobs) > MAX_EMAIL_SAFETY_CEILING:
+        print(
+            f"WARNING: Jobs count ({len(jobs)}) exceeds safety ceiling "
+            f"({MAX_EMAIL_SAFETY_CEILING}). Capping to safety ceiling."
+        )
+        jobs_to_send = jobs[:MAX_EMAIL_SAFETY_CEILING]
+    else:
+        jobs_to_send = jobs
+
     subject, html_content, text_content = build_email_digest(
-        jobs[:MAX_EMAIL_JOBS],
+        jobs_to_send,
         now_utc=now_utc,
     )
 
@@ -2023,7 +2001,7 @@ def send_email_report(
     message.add_alternative(html_content, subtype="html")
 
     print()
-    print("Connecting to Gmail SMTP (smtp.gmail.com:465)...")
+    print(f"Connecting to Gmail SMTP (smtp.gmail.com:465) to deliver {len(jobs_to_send)} qualifying jobs...")
 
     seen_jobs = state.setdefault("jobs", {})
 
@@ -2032,13 +2010,13 @@ def send_email_report(
             server.login(username, app_password)
             server.send_message(message)
 
-        print("Email sent successfully!")
-        run_metadata["emails_sent"] = len(jobs[:MAX_EMAIL_JOBS])
+        print(f"Email sent successfully! ({len(jobs_to_send)} jobs delivered)")
+        run_metadata["emails_sent"] = len(jobs_to_send)
         run_metadata["email_status"] = "success"
 
         # Update state: mark successfully emailed jobs with notification timestamps
         sent_now = datetime.now(timezone.utc).isoformat()
-        for job in jobs[:MAX_EMAIL_JOBS]:
+        for job in jobs_to_send:
             jid = job.get("_job_id")
             if jid and jid in seen_jobs:
                 seen_jobs[jid]["status"] = "emailed"
@@ -2055,10 +2033,10 @@ def send_email_report(
         print(f"ERROR: Gmail delivery failed: {error}")
         run_metadata["email_status"] = "failed"
         run_metadata["email_error"] = str(error)
-        run_metadata["email_failures"] = len(jobs[:MAX_EMAIL_JOBS])
+        run_metadata["email_failures"] = len(jobs_to_send)
 
         # Mark jobs as email_failed so they remain eligible for retry next run!
-        for job in jobs[:MAX_EMAIL_JOBS]:
+        for job in jobs_to_send:
             jid = job.get("_job_id")
             if jid and jid in seen_jobs:
                 seen_jobs[jid]["status"] = "email_failed"
@@ -2080,11 +2058,15 @@ def run_pipeline_once(
 ) -> tuple[list[dict], dict]:
     """
     Executes a single end-to-end acquisition cycle:
-    1. Scrapes due sources (LinkedIn Apify, Remote boards, ATS endpoints).
-    2. Runs cross-source deduplication and freshness evaluation.
-    3. Deterministic pre-filter + Groq batch matching.
-    4. Sends immediate Gmail notifications for high-match jobs.
-    5. Persists state atomically.
+    1. Multi-source acquisition (LinkedIn Apify, Remote boards, ATS endpoints).
+    2. Freshness & Cross-Source Deduplication.
+    3. Hard Company Filter (Reject Infosys and variants BEFORE Groq).
+    4. Deterministic Experience Filter (Fresher / 0-2 YOE only BEFORE Groq).
+    5. Strict Work-Location Filter (Mumbai, Hyderabad, Bangalore, Pune, Remote).
+    6. Role Relevance Filter (AI/ML/GenAI/LLM/Agentic/Applied AI).
+    7. Batched AI/Groq Matching (or deterministic local fallback) in batches of 15.
+    8. Sends immediate Gmail notifications for ALL qualifying jobs (no arbitrary cap).
+    9. Persists state atomically.
     """
     start_time = datetime.now(timezone.utc)
 
@@ -2101,6 +2083,14 @@ def run_pipeline_once(
         "email_retries": 0,
         "new_fresh_jobs": 0,
         "eligible_jobs": 0,
+        "company_matched_jobs": 0,
+        "company_rejected_jobs": 0,
+        "experience_matched_jobs": 0,
+        "experience_rejected_jobs": 0,
+        "location_matched_jobs": 0,
+        "location_rejected_jobs": 0,
+        "role_matched_jobs": 0,
+        "role_rejected_jobs": 0,
         "candidates_surviving_filter": 0,
         "high_match_jobs": 0,
         "high_priority_jobs": 0,
@@ -2131,27 +2121,53 @@ def run_pipeline_once(
         t_dedup = round(time.time() - t1, 2)
         run_metadata["latency_dedup_sec"] = t_dedup
 
-        # 3. Strict Work-Location Filter (Mumbai, Hyderabad, Bangalore, Pune, Remote)
-        t_loc = time.time()
-        location_matched_jobs = filter_jobs_by_strict_location(
+        # 3. Hard Company Filter (Reject Infosys and variants BEFORE Groq)
+        t_comp = time.time()
+        company_passed_jobs = filter_jobs_by_company(
             eligible_jobs,
             state=state,
             run_metadata=run_metadata,
         )
-        t_loc_sec = round(time.time() - t_loc, 2)
-        run_metadata["latency_location_sec"] = t_loc_sec
+        run_metadata["latency_company_sec"] = round(time.time() - t_comp, 2)
 
-        # 4. Local Relevance Prefilter + Groq Batch Matching
+        # 4. Deterministic Experience Filter (Fresher / 0-2 YOE only BEFORE Groq)
+        t_exp = time.time()
+        exp_passed_jobs = filter_jobs_by_experience(
+            company_passed_jobs,
+            state=state,
+            run_metadata=run_metadata,
+        )
+        run_metadata["latency_experience_sec"] = round(time.time() - t_exp, 2)
+
+        # 5. Strict Work-Location Filter (Mumbai, Hyderabad, Bangalore, Pune, Remote)
+        t_loc = time.time()
+        location_passed_jobs = filter_jobs_by_strict_location(
+            exp_passed_jobs,
+            state=state,
+            run_metadata=run_metadata,
+        )
+        run_metadata["latency_location_sec"] = round(time.time() - t_loc, 2)
+
+        # 6. Role Relevance Filter (AI/ML/GenAI/LLM/Agentic/Applied AI)
+        t_role = time.time()
+        role_passed_jobs = filter_jobs_by_role(
+            location_passed_jobs,
+            state=state,
+            run_metadata=run_metadata,
+        )
+        run_metadata["latency_role_sec"] = round(time.time() - t_role, 2)
+
+        # 7. Batched AI/Groq Matching (or local fallback)
         t2 = time.time()
         matched_jobs = score_and_rank_jobs(
-            location_matched_jobs,
+            role_passed_jobs,
             run_metadata,
             state=state,
         )
         t_matching = round(time.time() - t2, 2)
         run_metadata["latency_matching_sec"] = t_matching
 
-        # 5. Email Notification
+        # 8. Email Notification (Sends ALL qualifying jobs)
         t3 = time.time()
 
         dry_run = "--dry-run" in sys.argv or os.environ.get("DRY_RUN", "false").lower() == "true"
@@ -2171,6 +2187,28 @@ def run_pipeline_once(
             run_metadata["email_status"] = "dry_run"
         t_email = round(time.time() - t3, 2)
         run_metadata["latency_email_sec"] = t_email
+
+        # Track per-source diagnostic funnel metrics (RAW, NORMALIZED, NEW, COMPANY, EXPERIENCE, LOCATION, ROLE, FINAL ELIGIBLE)
+        sources_seen = set()
+        for j in raw_jobs:
+            s = j.get("source") or j.get("_source_provider") or "unknown"
+            sources_seen.add(s)
+        for sid in run_metadata.get("source_stats", {}).keys():
+            sources_seen.add(sid)
+
+        per_source = {}
+        for s in sources_seen:
+            per_source[s] = {
+                "raw": sum(1 for j in raw_jobs if (j.get("source") or j.get("_source_provider")) == s),
+                "normalized": sum(1 for j in raw_jobs if (j.get("source") or j.get("_source_provider")) == s),
+                "new": sum(1 for j in eligible_jobs if (j.get("source") or j.get("_source_provider")) == s),
+                "company_pass": sum(1 for j in company_passed_jobs if (j.get("source") or j.get("_source_provider")) == s),
+                "experience_pass": sum(1 for j in exp_passed_jobs if (j.get("source") or j.get("_source_provider")) == s),
+                "location_pass": sum(1 for j in location_passed_jobs if (j.get("source") or j.get("_source_provider")) == s),
+                "role_pass": sum(1 for j in role_passed_jobs if (j.get("source") or j.get("_source_provider")) == s),
+                "final_eligible": sum(1 for j in matched_jobs if (j.get("source") or j.get("_source_provider")) == s),
+            }
+        run_metadata["per_source_funnel"] = per_source
 
     except Exception as exc:
         print(f"WORKFLOW EXCEPTION: {exc}")
@@ -2196,16 +2234,17 @@ def run_pipeline_once(
 def print_run_summary(run_metadata: dict, start_time: datetime, end_time: datetime):
     """
     Format and print structured production execution logs per Rule 12.
+    Includes per-source diagnostic funnel table and rejected role titles.
     """
     print()
-    print("=" * 70)
-    print("JOB HUNTER RUN")
-    print("=" * 70)
+    print("=" * 80)
+    print("JOB HUNTER RUN SUMMARY")
+    print("=" * 80)
     print(f"Started: {start_time.isoformat()}")
     print()
     print("SOURCE RESULTS")
     print(f"{'Source':<18} {'Status':<12} {'Details'}")
-    print("-" * 70)
+    print("-" * 80)
     for sid, stat in run_metadata.get("source_stats", {}).items():
         name = stat.get("name", sid)
         status = stat.get("status", "N/A")
@@ -2214,7 +2253,7 @@ def print_run_summary(run_metadata: dict, start_time: datetime, end_time: dateti
         elapsed = stat.get("elapsed", 0)
         err = stat.get("error", "")
         if err:
-            details = f"error: {err[:40]} ({elapsed}s)"
+            details = f"error: {err[:50]} ({elapsed}s)"
         elif status in ("LIMITED", "UNAVAILABLE"):
             details = f"requires auth / no open feed ({elapsed}s)"
         else:
@@ -2222,42 +2261,94 @@ def print_run_summary(run_metadata: dict, start_time: datetime, end_time: dateti
         print(f"{name:<18} {status:<12} {details}")
 
     print()
-    print("FILTERING")
+    print("=" * 80)
+    print("PER-SOURCE DIAGNOSTIC FUNNEL")
+    print("=" * 80)
+    print(f"{'Source':<16} {'RAW':<6} {'NORM':<6} {'NEW':<6} {'COMP':<6} {'EXP':<6} {'LOC':<6} {'ROLE':<6} {'FINAL':<6}")
+    print("-" * 80)
+    per_source = run_metadata.get("per_source_funnel", {})
+    for sid, counts in sorted(per_source.items()):
+        print(
+            f"{sid:<16} "
+            f"{counts.get('raw', 0):<6} "
+            f"{counts.get('normalized', 0):<6} "
+            f"{counts.get('new', 0):<6} "
+            f"{counts.get('company_pass', 0):<6} "
+            f"{counts.get('experience_pass', 0):<6} "
+            f"{counts.get('location_pass', 0):<6} "
+            f"{counts.get('role_pass', 0):<6} "
+            f"{counts.get('final_eligible', 0):<6}"
+        )
+    print("-" * 80)
+
+    # Diagnostic title logging for sources where location passed but role was rejected
+    rejected_by_role = run_metadata.get("rejected_titles_by_role", {})
+    for sid, counts in sorted(per_source.items()):
+        if counts.get("location_pass", 0) > 0 and counts.get("role_pass", 0) == 0:
+            sample_titles = rejected_by_role.get(sid, [])[:10]
+            print(f"  [DIAGNOSTIC] {sid}: {counts.get('location_pass')} jobs passed location but 0 passed role.")
+            print(f"               Rejected titles: {sample_titles}")
+
+    print()
+    print("AGGREGATE FILTERING FUNNEL")
     print(f"Discovered:        {run_metadata.get('jobs_retrieved', 0)}")
     print(f"Fresh:             {run_metadata.get('jobs_within_freshness_window', 0)}")
-    print(f"Role matched:      {run_metadata.get('candidates_surviving_filter', 0)}")
-    print(f"Location matched:  {run_metadata.get('location_matched_jobs', run_metadata.get('candidates_surviving_filter', 0))}")
-    print(f"High-match (>=75): {run_metadata.get('high_match_jobs', 0)}")
+    print(f"Eligible:          {run_metadata.get('eligible_jobs', 0)}")
+    print(f"Company matched:   {run_metadata.get('company_matched_jobs', 0)}")
+    print(f"Experience matched:{run_metadata.get('experience_matched_jobs', 0)}")
+    print(f"Location matched:  {run_metadata.get('location_matched_jobs', 0)}")
+    print(f"Role matched:      {run_metadata.get('role_matched_jobs', 0)}")
+    print(f"High-match (>={MIN_MATCH_SCORE}): {run_metadata.get('high_match_jobs', 0)}")
     print(f"High-priority:     {run_metadata.get('high_priority_jobs', 0)}")
     print(f"Deduplicated:      {run_metadata.get('duplicates_skipped', 0)}")
     print(f"Sent:              {run_metadata.get('emails_sent', 0)}")
     print()
     print("LATENCY")
     print(f"Source retrieval:  {run_metadata.get('latency_retrieval_sec', 0)}s")
+    print(f"Company filter:    {run_metadata.get('latency_company_sec', 0)}s")
+    print(f"Experience filter: {run_metadata.get('latency_experience_sec', 0)}s")
+    print(f"Location filter:   {run_metadata.get('latency_location_sec', 0)}s")
+    print(f"Role filter:       {run_metadata.get('latency_role_sec', 0)}s")
     print(f"Matching:          {run_metadata.get('latency_matching_sec', 0)}s")
     print(f"Email:             {run_metadata.get('latency_email_sec', 0)}s")
     print(f"Total:             {run_metadata.get('latency_total_sec', 0)}s")
-    print("=" * 70)
+    print("=" * 80)
 
 
 def run_worker_loop():
     """
     Near-Real-Time Persistent Worker Daemon.
-    Continuously polls fast/medium/slow sources according to their individual intervals.
-    Dispatches immediate alerts when high-priority fresh jobs appear.
+    Continuously polls sources every ~15 minutes in a durable background loop.
+    Survives unexpected errors and catches signals cleanly.
     """
-    print("=" * 70)
-    print("AI JOB HUNTER - PERSISTENT WORKER STARTED (NEAR-REAL-TIME MODE)")
-    print("Polling sources according to individual intervals (Press Ctrl+C to stop).")
-    print("=" * 70)
+    poll_interval_sec = int(os.environ.get("WORKER_POLL_INTERVAL_SECONDS", "900"))
+    print("=" * 80)
+    print("AI JOB HUNTER - PERSISTENT WORKER STARTED (PRODUCTION PERSISTENT DAEMON)")
+    print(f"Polling loop interval: {poll_interval_sec}s (~{poll_interval_sec // 60}m) (Press Ctrl+C to stop).")
+    print(f"Durable state directory: {STATE_DIR}")
+    print("=" * 80)
 
     state = load_state()
+    cycle = 1
     try:
         while True:
-            matched_jobs, meta = run_pipeline_once(state, force_all=False)
-            time.sleep(30)
+            cycle_start = datetime.now(timezone.utc)
+            print()
+            print("=" * 80)
+            print(f"[WORKER] Starting polling cycle #{cycle} at {format_ist_and_utc(cycle_start)}...")
+            print("=" * 80)
+            try:
+                matched_jobs, meta = run_pipeline_once(state, force_all=True)
+                print(f"[WORKER] Cycle #{cycle} completed. Qualifying jobs delivered: {len(matched_jobs)}")
+            except Exception as loop_err:
+                print(f"ERROR: Worker cycle #{cycle} encountered an exception: {loop_err}")
+                traceback.print_exc()
+
+            cycle += 1
+            print(f"[WORKER] Sleeping for {poll_interval_sec}s (~{poll_interval_sec // 60}m) until cycle #{cycle}...")
+            time.sleep(poll_interval_sec)
     except KeyboardInterrupt:
-        print("\nWorker loop terminated by user.")
+        print("\n[WORKER] Worker loop terminated by user.")
     finally:
         save_state(state)
 

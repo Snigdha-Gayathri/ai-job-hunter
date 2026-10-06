@@ -12,9 +12,12 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "openai/gpt-oss-20b"
 
-# Hard cap.
-# Only ONE Groq request is made per workflow run.
-MAX_AI_JOBS = 15
+# Import batch size and match settings from config
+try:
+    from config import GROQ_BATCH_SIZE, MIN_MATCH_SCORE
+except ImportError:
+    GROQ_BATCH_SIZE = 15
+    MIN_MATCH_SCORE = 50
 
 # Local filtering keywords.
 AI_ROLE_KEYWORDS = {
@@ -465,15 +468,7 @@ def locally_filter_jobs(
 
     print(
         f"Local filter: {len(jobs)} jobs -> "
-        f"{len(candidates)} AI/ML candidates"
-    )
-
-    # Critical API-cost control.
-    candidates = candidates[:MAX_AI_JOBS]
-
-    print(
-        f"Sending maximum {len(candidates)} jobs "
-        f"to the single Groq request."
+        f"{len(candidates)} AI/ML candidates (retaining ALL candidates without truncation)"
     )
 
     return candidates
@@ -667,13 +662,10 @@ IMPORTANT:
 """
 
 
-def score_jobs_batch(jobs: list[dict]) -> list[dict]:
+def score_single_batch(jobs: list[dict]) -> list[dict]:
     """
-    Score multiple jobs with ONE Groq API request.
-
-    This is the primary AI matching path.
+    Score a single batch of up to GROQ_BATCH_SIZE jobs with one Groq API request.
     """
-
     if not jobs:
         return []
 
@@ -684,7 +676,7 @@ def score_jobs_batch(jobs: list[dict]) -> list[dict]:
     prompt = build_batch_prompt(jobs)
 
     print(
-        f"Sending ONE Groq batch request for {len(jobs)} jobs..."
+        f"Sending Groq batch request for {len(jobs)} jobs..."
     )
 
     payload = {
@@ -729,48 +721,57 @@ def score_jobs_batch(jobs: list[dict]) -> list[dict]:
         # DO NOT hammer the API on rate limits.
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
-
-            print(
-                "Groq rate limit reached."
-            )
-
+            print("Groq rate limit reached for this batch.")
             if retry_after:
-                print(
-                    f"Provider requested retry after "
-                    f"{retry_after} seconds."
-                )
-
-            print(
-                "No retry will be performed during this run."
-            )
-
+                print(f"Provider requested retry after {retry_after} seconds.")
+            print("Using local fallback for this batch.")
             return local_fallback_results(jobs)
 
         response.raise_for_status()
-
         data = response.json()
-
         content = data["choices"][0]["message"]["content"]
-
         results = extract_json(content)
 
         if not isinstance(results, list):
-            raise ValueError(
-                "Groq returned JSON, but not a JSON array."
-            )
+            raise ValueError("Groq returned JSON, but not a JSON array.")
 
         return merge_ai_results(jobs, results)
 
     except Exception as error:
-        print(
-            f"Groq batch matching failed: {error}"
-        )
-
-        print(
-            "Falling back to local scoring."
-        )
-
+        print(f"Groq batch matching failed: {error}. Falling back to local scoring.")
         return local_fallback_results(jobs)
+
+
+def score_jobs_batch(jobs: list[dict], batch_size: int = GROQ_BATCH_SIZE) -> list[dict]:
+    """
+    Score multiple jobs across ALL batches without any candidate truncation.
+    If 37 candidates are present:
+      Batch 1 = 15
+      Batch 2 = 15
+      Batch 3 = 7
+    All 37 candidates are evaluated and returned.
+    """
+    if not jobs:
+        return []
+
+    # If small enough, process as single batch
+    if len(jobs) <= batch_size:
+        return score_single_batch(jobs)
+
+    all_scored = []
+    num_batches = (len(jobs) + batch_size - 1) // batch_size
+    print(f"Processing {len(jobs)} total candidates across {num_batches} Groq batches (batch_size={batch_size})...")
+
+    for b_idx in range(num_batches):
+        batch = jobs[b_idx * batch_size : (b_idx + 1) * batch_size]
+        print(f"  [Groq Batch {b_idx + 1}/{num_batches}] Evaluating {len(batch)} candidates...")
+        scored_batch = score_single_batch(batch)
+        all_scored.extend(scored_batch)
+        if b_idx < num_batches - 1:
+            time.sleep(1.0)  # gentle pacing between batches to respect rate limits
+
+    print(f"All {len(all_scored)} candidates processed across {num_batches} batches.")
+    return all_scored
 
 
 def merge_ai_results(
@@ -884,6 +885,12 @@ def local_fallback_results(
     results = []
 
     for job in jobs:
+        if "local_score" not in job:
+            res = local_score_job(job)
+            job["local_score"] = res["local_score"]
+            job["local_reasons"] = res["local_reasons"]
+            job["technical_matches"] = res.get("technical_matches", [])
+
         score = job.get("local_score", 0)
 
         if score >= 85:

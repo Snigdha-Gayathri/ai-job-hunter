@@ -202,6 +202,22 @@ GMAIL_APP_PASSWORD = os.getenv(
 
 
 # ============================================================
+# COMPANY EXCLUSIONS
+# ============================================================
+
+# Companies explicitly excluded from all processing and alerts
+EXCLUDED_COMPANIES = [
+    "infosys",
+    "infosys limited",
+    "infosys bpm",
+    "infosys bpm limited",
+    "infosys technologies",
+    "infosys consulting",
+    "edgeverve",  # Infosys subsidiary
+]
+
+
+# ============================================================
 # JOB TARGETING (ROLES, LOCATIONS & EXPERIENCE)
 # ============================================================
 
@@ -210,28 +226,41 @@ TARGET_ROLE_FAMILIES = [
     "AI/ML Engineer",
     "Machine Learning Engineer",
     "ML Engineer",
-    "GenAI Engineer",
     "Generative AI Engineer",
+    "GenAI Engineer",
     "LLM Engineer",
-    "Applied AI Engineer",
+    "LLM Application Engineer",
     "Agentic AI Engineer",
+    "AI Agent Engineer",
+    "Applied AI Engineer",
+    "AI Software Engineer",
+    "AI Platform Engineer",
+    "AI Solutions Engineer",
     "AI Research Engineer",
     "NLP Engineer",
     "Computer Vision Engineer",
-    "AI Software Engineer",
-    "Junior AI Engineer",
-    "Associate AI Engineer",
-    "AI Engineer Intern",
-    "ML Engineer Intern",
-    "Machine Learning Intern",
-    "GenAI Engineer Intern",
+    "Machine Learning Scientist",
+    "AI Developer",
+    "ML Developer",
+    "Generative AI Developer",
+    "AI Automation Engineer",
+    "AI Product Engineer",
+    "AI Intern",
+    "ML Intern",
+    "AI/ML Intern",
     "GenAI Intern",
     "LLM Intern",
-    "GenAI/LLM Intern",
     "Agentic AI Intern",
     "Applied AI Intern",
     "AI Research Intern",
-    "AI Intern",
+    "AI Trainee",
+    "ML Trainee",
+    "Graduate AI Engineer",
+    "Graduate ML Engineer",
+    "Junior AI Engineer",
+    "Junior ML Engineer",
+    "Associate AI Engineer",
+    "Associate ML Engineer",
 ]
 
 TARGET_LOCATIONS = [
@@ -243,14 +272,23 @@ TARGET_LOCATIONS = [
     "remote",
 ]
 
-
 TARGET_EXPERIENCE_KEYWORDS = [
     "fresher",
+    "freshers",
+    "fresh graduate",
+    "new graduate",
+    "recent graduate",
     "0 years",
+    "0 year",
     "0-1 years",
+    "0–1 years",
     "0-2 years",
+    "0–2 years",
     "0 to 1 years",
     "0 to 2 years",
+    "1 year",
+    "1-2 years",
+    "1–2 years",
     "entry level",
     "entry-level",
     "graduate",
@@ -261,25 +299,34 @@ TARGET_EXPERIENCE_KEYWORDS = [
     "internship",
     "trainee",
     "student",
+    "apprentice",
 ]
 
 
 # ============================================================
-# PRIORITY / ALERTING THRESHOLDS & FRESHNESS WINDOWS
+# PIPELINE LIMITS & BATCHING (NO ARBITRARY CANDIDATE LOSS)
 # ============================================================
 
+# Number of jobs evaluated in a single Groq API request.
+# All candidate batches are processed without truncation.
+GROQ_BATCH_SIZE = 15
+
+# Soft match floor for ranking (qualifying roles passing hard filters remain eligible)
+MIN_MATCH_SCORE = 50
+
+# Emergency ceiling only to prevent email payload overflow (no arbitrary 20-job cap)
+MAX_EMAIL_SAFETY_CEILING = 200
+
+# Raw candidate pool size for LinkedIn multi-partition collection
+MAX_SCRAPED_JOBS = 300
+
+# High-priority alert window and score
 HIGH_PRIORITY_SCORE = 80
 MEDIUM_PRIORITY_SCORE = 65
 HIGH_PRIORITY_MAX_AGE_MINUTES = 180  # 3 hours (immediate alert)
 
-# Fast-stream Freshness Window (e.g. LinkedIn hourly execution):
-# Targets jobs posted within the last 90 minutes.
+# Operating freshness windows for reporting/ranking
 FRESHNESS_WINDOW_MINUTES = int(os.environ.get("FRESHNESS_WINDOW_MINUTES", "90"))
-
-# Active Posting Freshness Window for ATS & Remote Job Boards:
-# Eligible jobs posted within the last 48 hours are processed and evaluated upon first discovery.
-# Stale back-catalog listings (> 48h) are filtered out.
-# Once processed, persistent state ensures jobs are NEVER emailed or re-processed again.
 ATS_FRESHNESS_WINDOW_HOURS = int(os.environ.get("ATS_FRESHNESS_WINDOW_HOURS", "48"))
 ATS_FRESHNESS_WINDOW_MINUTES = int(
     os.environ.get("ATS_FRESHNESS_WINDOW_MINUTES", str(ATS_FRESHNESS_WINDOW_HOURS * 60))
@@ -333,7 +380,7 @@ SOURCES_CONFIG = {
         "category": "linkedin",
         "acquisition_method": "apify_actor",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_LINKEDIN", "25")),
-        "max_results": 50,
+        "max_results": int(os.getenv("MAX_SCRAPED_JOBS", str(MAX_SCRAPED_JOBS))),
     },
     # 2. Remote OK (Official JSON API)
     "remoteok": {
@@ -342,7 +389,7 @@ SOURCES_CONFIG = {
         "category": "remote_board",
         "acquisition_method": "json_api",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_REMOTEOK", "3")),
-        "max_results": 50,
+        "max_results": int(os.getenv("MAX_SCRAPED_JOBS", str(MAX_SCRAPED_JOBS))),
         "endpoint": "https://remoteok.com/api",
     },
     # 3. Remotive (Official JSON API)
@@ -352,7 +399,7 @@ SOURCES_CONFIG = {
         "category": "remote_board",
         "acquisition_method": "json_api",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_REMOTIVE", "5")),
-        "max_results": 50,
+        "max_results": int(os.getenv("MAX_SCRAPED_JOBS", str(MAX_SCRAPED_JOBS))),
         "endpoint": "https://remotive.com/api/remote-jobs",
     },
     # 4. Working Nomads (Official JSON API)
@@ -362,7 +409,7 @@ SOURCES_CONFIG = {
         "category": "remote_board",
         "acquisition_method": "json_api",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_WORKINGNOMADS", "10")),
-        "max_results": 40,
+        "max_results": int(os.getenv("MAX_SCRAPED_JOBS", str(MAX_SCRAPED_JOBS))),
         "endpoint": "https://www.workingnomads.com/api/exposed_jobs/",
     },
     # 5. We Work Remotely (RSS Feeds)
@@ -372,7 +419,7 @@ SOURCES_CONFIG = {
         "category": "remote_board",
         "acquisition_method": "rss_feed",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_WWR", "5")),
-        "max_results": 40,
+        "max_results": int(os.getenv("MAX_SCRAPED_JOBS", str(MAX_SCRAPED_JOBS))),
         "feeds": [
             "https://weworkremotely.com/categories/remote-programming-jobs.rss",
             "https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss",
@@ -385,7 +432,7 @@ SOURCES_CONFIG = {
         "category": "remote_board",
         "acquisition_method": "rss_feed",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_NODESK", "10")),
-        "max_results": 30,
+        "max_results": int(os.getenv("MAX_SCRAPED_JOBS", str(MAX_SCRAPED_JOBS))),
         "feed": "https://nodesk.co/remote-jobs/index.xml",
     },
     # 7. SkipTheDrive (Public feed / listings)
@@ -395,7 +442,7 @@ SOURCES_CONFIG = {
         "category": "remote_board",
         "acquisition_method": "rss_feed",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_SKIPTHEDRIVE", "20")),
-        "max_results": 30,
+        "max_results": int(os.getenv("MAX_SCRAPED_JOBS", str(MAX_SCRAPED_JOBS))),
         "feed": "https://www.skipthedrive.com/jobs/feed/",
     },
     # 8. Remote.co
@@ -405,7 +452,7 @@ SOURCES_CONFIG = {
         "category": "remote_board",
         "acquisition_method": "rss_feed",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_REMOTECO", "20")),
-        "max_results": 30,
+        "max_results": int(os.getenv("MAX_SCRAPED_JOBS", str(MAX_SCRAPED_JOBS))),
         "feed": "https://remote.co/remote-jobs/developer/feed/",
     },
     # 9. Remote100K
@@ -415,7 +462,7 @@ SOURCES_CONFIG = {
         "category": "remote_board",
         "acquisition_method": "structured_web",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_REMOTE100K", "20")),
-        "max_results": 20,
+        "max_results": 50,
     },
     # 10. JustRemote
     "justremote": {
@@ -424,7 +471,7 @@ SOURCES_CONFIG = {
         "category": "remote_board",
         "acquisition_method": "structured_web",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_JUSTREMOTE", "20")),
-        "max_results": 20,
+        "max_results": 50,
     },
     # 11. ATS: Greenhouse (Public Boards API)
     "greenhouse": {
@@ -433,7 +480,7 @@ SOURCES_CONFIG = {
         "category": "ats",
         "acquisition_method": "json_api",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_GREENHOUSE", "3")),
-        "max_results": 50,
+        "max_results": int(os.getenv("MAX_SCRAPED_JOBS", str(MAX_SCRAPED_JOBS))),
         "companies": ATS_TARGET_COMPANIES["greenhouse"],
     },
     # 12. ATS: Lever (Public Postings API)
@@ -443,7 +490,7 @@ SOURCES_CONFIG = {
         "category": "ats",
         "acquisition_method": "json_api",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_LEVER", "3")),
-        "max_results": 50,
+        "max_results": int(os.getenv("MAX_SCRAPED_JOBS", str(MAX_SCRAPED_JOBS))),
         "companies": ATS_TARGET_COMPANIES["lever"],
     },
     # 13. ATS: Ashby (Public Job Board API)
@@ -453,7 +500,7 @@ SOURCES_CONFIG = {
         "category": "ats",
         "acquisition_method": "json_api",
         "polling_interval_minutes": int(os.getenv("POLL_INTERVAL_ASHBY", "3")),
-        "max_results": 50,
+        "max_results": int(os.getenv("MAX_SCRAPED_JOBS", str(MAX_SCRAPED_JOBS))),
         "companies": ATS_TARGET_COMPANIES["ashby"],
     },
     # 14. Indeed
