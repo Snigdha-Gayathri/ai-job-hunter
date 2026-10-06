@@ -383,6 +383,8 @@ class RemoteOKSource(BaseSource):
         title = str(raw.get("position") or "").strip()
         company = str(raw.get("company") or "").strip()
         location = str(raw.get("location") or "").strip()
+        if not location or location.lower() in ("worldwide", "anywhere", "global"):
+            location = "Remote"
         raw_url = str(raw.get("url") or "")
         canonical_url = normalize_url(raw_url)
         description = str(raw.get("description") or "")
@@ -395,6 +397,7 @@ class RemoteOKSource(BaseSource):
             "company": company,
             "location": location,
             "remote_type": "remote",
+            "workplace": "remote",
             "description": description,
             "url": canonical_url,
             "apply_url": canonical_url,
@@ -443,6 +446,8 @@ class RemotiveSource(BaseSource):
         title = str(raw.get("title") or "").strip()
         company = str(raw.get("company_name") or "").strip()
         location = str(raw.get("candidate_required_location") or raw.get("location") or "").strip()
+        if not location or location.lower() in ("worldwide", "anywhere", "global"):
+            location = "Remote"
         raw_url = str(raw.get("url") or "")
         canonical_url = normalize_url(raw_url)
         description = str(raw.get("description") or "")
@@ -455,6 +460,7 @@ class RemotiveSource(BaseSource):
             "company": company,
             "location": location,
             "remote_type": "remote",
+            "workplace": "remote",
             "description": description,
             "url": canonical_url,
             "apply_url": canonical_url,
@@ -820,7 +826,7 @@ class GreenhouseSource(BaseSource):
                             "data", "research", "intern", "applied", "software", "scientist"
                         ])
                     ]
-                    selected = tech_jobs[:25] if tech_jobs else jobs[:10]
+                    selected = tech_jobs if tech_jobs else jobs
                     for j in selected:
                         j["_company_token"] = token
                     all_jobs.extend(selected)
@@ -896,7 +902,7 @@ class LeverSource(BaseSource):
                                 "data", "research", "intern", "applied", "software", "scientist"
                             ])
                         ]
-                        selected = tech_jobs[:25] if tech_jobs else data[:10]
+                        selected = tech_jobs if tech_jobs else data
                         for j in selected:
                             j["_company_id"] = company_id
                         all_jobs.extend(selected)
@@ -974,7 +980,7 @@ class AshbySource(BaseSource):
                             "data", "research", "intern", "applied", "software", "scientist"
                         ])
                     ]
-                    selected = tech_jobs[:25] if tech_jobs else jobs[:10]
+                    selected = tech_jobs if tech_jobs else jobs
                     for j in selected:
                         j["_org_slug"] = slug
                     all_jobs.extend(selected)
