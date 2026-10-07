@@ -2520,6 +2520,7 @@ def print_run_summary(run_metadata: dict, start_time: datetime, end_time: dateti
     print("-" * 80)
 
     # Diagnostic title logging
+    per_source = run_metadata.get("per_source_funnel", {})
     rejected_by_role = run_metadata.get("rejected_titles_by_role", {})
     for sid, counts in sorted(per_source.items()):
         if counts.get("location_pass", 0) > 0 and counts.get("role_pass", 0) == 0:
