@@ -2,9 +2,16 @@ name: Hourly AI Job Hunter
 
 on:
   schedule:
-    # Runs every 15 minutes to dramatically reduce job detection latency
-    # while staying well within GitHub Actions fair use guidelines.
-    - cron: "*/15 * * * *"
+    # Runs once every hour, 24 hours a day, at :17 past the hour IST (Asia/Kolkata).
+    # IST is UTC+5:30 (no DST in India).
+    # Therefore, IST HH:17 = UTC (HH-6):47.
+    # POSIX cron expression '47 * * * *' in UTC fires continuously every hour:
+    #   UTC 18:47 = IST 00:17
+    #   UTC 19:47 = IST 01:17
+    #   ...
+    #   UTC 17:47 = IST 23:17
+    # An off-minute (:17 IST / :47 UTC) minimizes GitHub Actions scheduler congestion.
+    - cron: "47 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -27,9 +34,28 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+
+      - name: Validate required secrets
+        env:
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: |
+          missing=()
+          [ -z "$APIFY_API_TOKEN" ] && missing+=("APIFY_API_TOKEN")
+          [ -z "$GROQ_API_KEY" ] && missing+=("GROQ_API_KEY")
+          [ -z "$GMAIL_USERNAME" ] && missing+=("GMAIL_USERNAME")
+          [ -z "$GMAIL_APP_PASSWORD" ] && missing+=("GMAIL_APP_PASSWORD")
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Missing required GitHub Actions secret(s): ${missing[*]}"
+            echo "Configure these secrets in GitHub Repo Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
 
       # Persistent state prevents the same jobs from being
-      # processed repeatedly across hourly workflow runs.
+      # processed or emailed repeatedly across hourly workflow runs.
       - name: Restore job hunter state
         uses: actions/cache/restore@v4
         with:
@@ -43,7 +69,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run AI Job Hunter
+      - name: Run AI Job Hunter (One-Shot)
         env:
           APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
           BRIGHT_DATA_API_KEY: ${{ secrets.BRIGHT_DATA_API_KEY }}
@@ -52,7 +78,7 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: |
           cd agent
-          python main.py
+          python main.py --once
 
       # Save the updated seen-job database for the next run.
       # Only saves on success so a failed run cannot corrupt the persistent state cache.
@@ -62,3 +88,13 @@ jobs:
         with:
           path: agent/state
           key: job-hunter-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Upload state & telemetry metrics as a build artifact for audits, diagnostics, and debugging.
+      - name: Upload job hunter state artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: job-hunter-state-${{ github.run_id }}
+          path: agent/state/
+          retention-days: 7
+          if-no-files-found: ignore

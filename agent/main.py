@@ -343,7 +343,7 @@ def load_state() -> dict:
 
 def save_state(state: dict):
     """
-    Save persistent job state and metrics to disk.
+    Save persistent job state and metrics to disk atomically.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -373,8 +373,13 @@ def save_state(state: dict):
         print(
             f"State saved: {len(state['jobs'])} jobs tracked."
         )
+        if "last_run" in state and isinstance(state["last_run"], dict):
+            state["last_run"]["state_persistence"] = "SUCCESS"
     except Exception as error:
         print(f"ERROR: Could not save state: {error}")
+        if "last_run" in state and isinstance(state["last_run"], dict):
+            state["last_run"]["state_persistence"] = f"FAILED: {error}"
+        raise RuntimeError(f"State persistence failed: {error}") from error
 
 
 # ============================================================
@@ -2223,9 +2228,15 @@ def run_pipeline_once(
         state["last_run"] = run_metadata
 
         # Atomic state persistence
-        save_state(state)
+        try:
+            save_state(state)
+            run_metadata["state_persistence"] = "SUCCESS"
+        except Exception as state_err:
+            run_metadata["state_persistence"] = f"FAILED: {state_err}"
+            run_metadata["workflow_errors"].append(f"State persistence failure: {state_err}")
+            print(f"FATAL: State persistence failed: {state_err}")
 
-        # Production summary logging (Rule 12)
+        # Production summary logging & telemetry funnel
         print_run_summary(run_metadata, start_time, end_time)
 
     return matched_jobs, run_metadata
@@ -2233,19 +2244,73 @@ def run_pipeline_once(
 
 def print_run_summary(run_metadata: dict, start_time: datetime, end_time: datetime):
     """
-    Format and print structured production execution logs per Rule 12.
-    Includes per-source diagnostic funnel table and rejected role titles.
+    Format and print structured production execution logs and concise funnel telemetry.
+    Never prints API keys, Gmail app passwords, or other sensitive secrets.
     """
+    raw_count = run_metadata.get("jobs_retrieved", 0)
+    norm_count = raw_count
+    new_count = run_metadata.get("eligible_jobs", 0)
+    comp_count = run_metadata.get("company_matched_jobs", 0)
+    exp_count = run_metadata.get("experience_matched_jobs", 0)
+    loc_count = run_metadata.get("location_matched_jobs", 0)
+    role_count = run_metadata.get("role_matched_jobs", 0)
+    final_count = run_metadata.get("high_match_jobs", 0)
+    emailed_count = run_metadata.get("emails_sent", 0)
+    email_failed_count = run_metadata.get("email_failures", 0)
+
+    dedup_count = run_metadata.get("duplicates_skipped", 0)
+    comp_rejected = run_metadata.get("company_rejected_jobs", 0)
+    exp_rejected = run_metadata.get("experience_rejected_jobs", 0)
+    loc_rejected = run_metadata.get("location_rejected_jobs", 0)
+    role_rejected = run_metadata.get("role_rejected_jobs", 0)
+
+    source_stats = run_metadata.get("source_stats", {})
+    li_count = source_stats.get("linkedin", {}).get("raw", 0)
+    non_li_count = sum(
+        stat.get("raw", 0) for sid, stat in source_stats.items() if sid != "linkedin"
+    )
+    state_persist = run_metadata.get("state_persistence", "SUCCESS")
+
     print()
     print("=" * 80)
-    print("JOB HUNTER RUN SUMMARY")
+    print("JOB HUNTER RUN SUMMARY & TELEMETRY FUNNEL")
     print("=" * 80)
-    print(f"Started: {start_time.isoformat()}")
+    print(f"Run Started (UTC): {start_time.isoformat()}")
+    print(f"Run Started (IST): {format_ist_and_utc(start_time)}")
+    print(f"Run Ended (UTC):   {end_time.isoformat()}")
+    print(f"Run Ended (IST):   {format_ist_and_utc(end_time)}")
+    print(f"Total Duration:    {run_metadata.get('latency_total_sec', 0)}s")
     print()
-    print("SOURCE RESULTS")
-    print(f"{'Source':<18} {'Status':<12} {'Details'}")
     print("-" * 80)
-    for sid, stat in run_metadata.get("source_stats", {}).items():
+    print("CONCISE FILTERING FUNNEL")
+    print("-" * 80)
+    print(f"  RAW:          {raw_count}")
+    print(f"  NORM:         {norm_count}")
+    print(f"  NEW:          {new_count}")
+    print(f"  COMP:         {comp_count}")
+    print(f"  EXP:          {exp_count}")
+    print(f"  LOC:          {loc_count}")
+    print(f"  ROLE:         {role_count}")
+    print(f"  FINAL:        {final_count}")
+    print(f"  EMAILED:      {emailed_count}")
+    print(f"  EMAIL_FAILED: {email_failed_count}")
+    print(
+        f"Summary: RAW={raw_count} -> NORM={norm_count} -> NEW={new_count} -> "
+        f"COMP={comp_count} -> EXP={exp_count} -> LOC={loc_count} -> "
+        f"ROLE={role_count} -> FINAL={final_count} -> EMAILED={emailed_count} "
+        f"(EMAIL_FAILED={email_failed_count})"
+    )
+    print()
+    print("-" * 80)
+    print("SOURCE COUNTS & BREAKDOWN")
+    print("-" * 80)
+    print(f"Total Sources Queried:        {len(source_stats)}")
+    print(f"LinkedIn Jobs Acquired:       {li_count}")
+    print(f"Non-LinkedIn Jobs Acquired:   {non_li_count}")
+    print()
+    print(f"{'Source':<18} {'Status':<12} {'Raw':<6} {'Valid':<6} {'Details'}")
+    print("-" * 80)
+    for sid, stat in sorted(source_stats.items()):
         name = stat.get("name", sid)
         status = stat.get("status", "N/A")
         raw = stat.get("raw", 0)
@@ -2253,17 +2318,17 @@ def print_run_summary(run_metadata: dict, start_time: datetime, end_time: dateti
         elapsed = stat.get("elapsed", 0)
         err = stat.get("error", "")
         if err:
-            details = f"error: {err[:50]} ({elapsed}s)"
+            details = f"error: {err[:40]} ({elapsed}s)"
         elif status in ("LIMITED", "UNAVAILABLE"):
             details = f"requires auth / no open feed ({elapsed}s)"
         else:
-            details = f"raw={raw:<3} valid={valid:<3} ({elapsed}s)"
-        print(f"{name:<18} {status:<12} {details}")
+            details = f"fetched in {elapsed}s"
+        print(f"{name:<18} {status:<12} {raw:<6} {valid:<6} {details}")
 
     print()
-    print("=" * 80)
+    print("-" * 80)
     print("PER-SOURCE DIAGNOSTIC FUNNEL")
-    print("=" * 80)
+    print("-" * 80)
     print(f"{'Source':<16} {'RAW':<6} {'NORM':<6} {'NEW':<6} {'COMP':<6} {'EXP':<6} {'LOC':<6} {'ROLE':<6} {'FINAL':<6}")
     print("-" * 80)
     per_source = run_metadata.get("per_source_funnel", {})
@@ -2281,7 +2346,7 @@ def print_run_summary(run_metadata: dict, start_time: datetime, end_time: dateti
         )
     print("-" * 80)
 
-    # Diagnostic title logging for sources where location passed but role was rejected
+    # Diagnostic title logging
     rejected_by_role = run_metadata.get("rejected_titles_by_role", {})
     for sid, counts in sorted(per_source.items()):
         if counts.get("location_pass", 0) > 0 and counts.get("role_pass", 0) == 0:
@@ -2290,28 +2355,32 @@ def print_run_summary(run_metadata: dict, start_time: datetime, end_time: dateti
             print(f"               Rejected titles: {sample_titles}")
 
     print()
-    print("AGGREGATE FILTERING FUNNEL")
-    print(f"Discovered:        {run_metadata.get('jobs_retrieved', 0)}")
-    print(f"Fresh:             {run_metadata.get('jobs_within_freshness_window', 0)}")
-    print(f"Eligible:          {run_metadata.get('eligible_jobs', 0)}")
-    print(f"Company matched:   {run_metadata.get('company_matched_jobs', 0)}")
-    print(f"Experience matched:{run_metadata.get('experience_matched_jobs', 0)}")
-    print(f"Location matched:  {run_metadata.get('location_matched_jobs', 0)}")
-    print(f"Role matched:      {run_metadata.get('role_matched_jobs', 0)}")
-    print(f"High-match (>={MIN_MATCH_SCORE}): {run_metadata.get('high_match_jobs', 0)}")
-    print(f"High-priority:     {run_metadata.get('high_priority_jobs', 0)}")
-    print(f"Deduplicated:      {run_metadata.get('duplicates_skipped', 0)}")
-    print(f"Sent:              {run_metadata.get('emails_sent', 0)}")
+    print("-" * 80)
+    print("REJECTIONS & DEDUPLICATION SUMMARY")
+    print("-" * 80)
+    print(f"Deduplicated (Skipped):        {dedup_count}")
+    print(f"Rejected by Company (Infosys): {comp_rejected}")
+    print(f"Rejected by Experience:        {exp_rejected}")
+    print(f"Rejected by Location:          {loc_rejected}")
+    print(f"Rejected by Role Relevance:    {role_rejected}")
     print()
-    print("LATENCY")
-    print(f"Source retrieval:  {run_metadata.get('latency_retrieval_sec', 0)}s")
-    print(f"Company filter:    {run_metadata.get('latency_company_sec', 0)}s")
-    print(f"Experience filter: {run_metadata.get('latency_experience_sec', 0)}s")
-    print(f"Location filter:   {run_metadata.get('latency_location_sec', 0)}s")
-    print(f"Role filter:       {run_metadata.get('latency_role_sec', 0)}s")
-    print(f"Matching:          {run_metadata.get('latency_matching_sec', 0)}s")
-    print(f"Email:             {run_metadata.get('latency_email_sec', 0)}s")
-    print(f"Total:             {run_metadata.get('latency_total_sec', 0)}s")
+    print("-" * 80)
+    print("EMAIL DELIVERY & STATE PERSISTENCE")
+    print("-" * 80)
+    print(f"Jobs Emailed:                  {emailed_count}")
+    print(f"Email Failures:                {email_failed_count}")
+    print(f"Email Status:                  {run_metadata.get('email_status', 'N/A')}")
+    print(f"State Persistence:             {state_persist}")
+    print()
+    print("LATENCY BREAKDOWN")
+    print(f"Source retrieval:              {run_metadata.get('latency_retrieval_sec', 0)}s")
+    print(f"Company filter:                {run_metadata.get('latency_company_sec', 0)}s")
+    print(f"Experience filter:             {run_metadata.get('latency_experience_sec', 0)}s")
+    print(f"Location filter:               {run_metadata.get('latency_location_sec', 0)}s")
+    print(f"Role filter:                   {run_metadata.get('latency_role_sec', 0)}s")
+    print(f"Matching:                      {run_metadata.get('latency_matching_sec', 0)}s")
+    print(f"Email:                         {run_metadata.get('latency_email_sec', 0)}s")
+    print(f"Total Latency:                 {run_metadata.get('latency_total_sec', 0)}s")
     print("=" * 80)
 
 
@@ -2355,18 +2424,33 @@ def run_worker_loop():
 
 def main():
     """
-    Standard single-pass execution used by GitHub Actions and scheduled runs.
+    Standard one-shot execution used by GitHub Actions and scheduled runs.
+    Performs exactly ONE complete job-hunting cycle and exits.
     """
     start_time = datetime.now(timezone.utc)
-    print("=" * 70)
-    print("AI JOB HUNTER PIPELINE STARTED")
-    print(f"Start Time: {format_ist_and_utc(start_time)}")
-    print("=" * 70)
+    print("=" * 80)
+    print("AI JOB HUNTER - ONE-SHOT EXECUTION CYCLE")
+    print(f"Start Time (UTC): {start_time.isoformat()}")
+    print(f"Start Time (IST): {format_ist_and_utc(start_time)}")
+    print("=" * 80)
 
     state = load_state()
-    print(f"Tracked jobs in database: {len(state.get('jobs', {}))}")
+    print(f"Persistent state loaded: {len(state.get('jobs', {}))} jobs tracked in database.")
 
     matched_jobs, run_metadata = run_pipeline_once(state, force_all=True)
+
+    # Fail loudly if unhandled fatal errors occurred (e.g. state persistence failure or critical workflow failure)
+    fatal_errors = run_metadata.get("workflow_errors", [])
+    if fatal_errors:
+        print()
+        print(f"FATAL: One-shot execution cycle finished with {len(fatal_errors)} fatal error(s):")
+        for err in fatal_errors:
+            print(f"  - {err}")
+        sys.exit(1)
+
+    print()
+    print(f"One-shot job-hunting cycle completed successfully ({len(matched_jobs)} qualifying jobs matched).")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
@@ -2374,6 +2458,7 @@ if __name__ == "__main__":
         print("AI Job Hunter - Multi-Source Real-Time Pipeline")
         print("Usage: python main.py [options]")
         print("Options:")
+        print("  --once             : Run exactly one complete job-hunting cycle and exit (default)")
         print("  --worker, --daemon : Run continuously as a lightweight background polling daemon")
         print("  --dry-run          : Run one acquisition pass without sending emails")
         print("  --help, -h         : Show this help message and exit")
