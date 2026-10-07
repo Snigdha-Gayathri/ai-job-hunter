@@ -35,6 +35,7 @@ from main import (
     format_ist_and_utc,
     get_job_id,
     load_state,
+    print_run_summary,
     process_jobs_freshness_and_state,
     save_state,
     score_and_rank_jobs,
@@ -801,6 +802,65 @@ class TestSchedulerAndState(unittest.TestCase):
         eligible = process_jobs_freshness_and_state([job], state, now_utc, meta)
         self.assertEqual(len(eligible), 1, "Historically rejected job must be allowed through for re-evaluation")
         self.assertEqual(meta["duplicates_skipped"], 0)
+
+    # -------------------------------------------------------------------------
+    # TEST 24: print_run_summary executes cleanly without NameError or crash
+    # -------------------------------------------------------------------------
+    def test_print_run_summary_executes_without_error(self):
+        """Verify print_run_summary renders without NameError across populated and empty metadata."""
+        start_time = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+        end_time = datetime(2026, 10, 8, 12, 1, 0, tzinfo=timezone.utc)
+
+        meta = {
+            "jobs_retrieved": 10,
+            "stale_jobs_filtered": 2,
+            "eligible_jobs": 8,
+            "duplicates_skipped": 1,
+            "company_matched_jobs": 7,
+            "company_rejected_jobs": 1,
+            "experience_matched_jobs": 6,
+            "experience_rejected_jobs": 1,
+            "location_matched_jobs": 5,
+            "location_rejected_jobs": 1,
+            "role_matched_jobs": 4,
+            "role_rejected_jobs": 1,
+            "candidates_surviving_filter": 4,
+            "high_match_jobs": 3,
+            "emails_sent": 3,
+            "email_failures": 0,
+            "linkedin_metrics": {
+                "partitions_submitted": 20,
+                "partitions_successful": 20,
+                "partitions_failed": 0,
+                "total_items_returned": 25,
+                "total_normalized_jobs": 25,
+                "total_fresh_jobs": 20,
+            },
+            "source_stats": {
+                "linkedin": {"name": "LinkedIn (Apify)", "status": "OK", "raw": 25, "valid": 25, "elapsed": 10},
+                "ashby": {"name": "Ashby", "status": "OK", "raw": 30, "valid": 30, "elapsed": 2},
+            },
+            "source_funnel": {
+                "linkedin": {"raw": 25, "stale": 2, "duplicate": 1, "eligible": 22},
+                "ashby": {"raw": 30, "stale": 10, "duplicate": 5, "eligible": 15},
+            },
+            "per_source_funnel": {
+                "linkedin": {"raw": 25, "normalized": 25, "new": 22, "location_pass": 20, "role_pass": 15},
+                "ashby": {"raw": 30, "normalized": 30, "new": 15, "location_pass": 5, "role_pass": 0},
+            },
+            "rejected_titles_by_role": {
+                "ashby": ["Frontend Engineer", "DevOps Engineer"],
+            },
+            "latency_total_sec": 60.0,
+            "email_status": "sent",
+            "state_persistence": "SUCCESS",
+        }
+
+        # Should execute completely without throwing NameError or any exception
+        print_run_summary(meta, start_time, end_time)
+
+        # Also test with minimal/empty metadata
+        print_run_summary({}, start_time, end_time)
 
 
 if __name__ == "__main__":
