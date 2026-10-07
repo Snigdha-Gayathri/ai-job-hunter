@@ -861,11 +861,22 @@ def execute_apify_run(
         )
         print(f"ERROR: {err_msg}")
         run_metadata["scraper_errors"].append(err_msg)
+
+        # Check for monthly usage hard limit exceeded
+        if (
+            response.status_code == 403
+            or "Monthly usage hard limit exceeded" in response.text
+            or "platform-feature-disabled" in response.text
+        ):
+            print(f"[{label}] Apify monthly usage hard limit exceeded (HTTP 403). Marking source as APIFY_USAGE_LIMITED.")
+            run_metadata["apify_usage_limited"] = True
+
         return [], {
             "status": response.status_code,
             "error": err_msg,
             "duration": duration,
             "actor_run_id": actor_run_id,
+            "usage_limited": run_metadata.get("apify_usage_limited", False),
         }
 
     try:
@@ -1195,30 +1206,34 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
     jobs_1, meta_1 = execute_apify_run(payload, params, "Run 1", run_metadata)
 
     # If startUrls returned 0 items, run fallback direct query to ensure resilience
+    # (Skip if Apify account monthly usage hard limit was reached to prevent redundant failed requests)
     if not jobs_1:
-        print()
-        print("[APIFY FALLBACK] startUrls yielded 0 jobs. Running direct search queries fallback...")
-        fallback_payload = {
-            "searchQuery": "AI Engineer",
-            "searchQueries": [
-                "AI Engineer",
-                "Machine Learning Engineer",
-                "Generative AI Engineer",
-                "LLM Engineer",
-                "AI Intern",
-            ],
-            "locations": ["Bangalore", "Hyderabad", "Pune", "Mumbai", "Remote"],
-            "location": "India",
-            "maxItems": 50,
-            "maxJobs": 50,
-            "datePosted": "r86400",
-            "sortBy": "DD",
-            "scrapeJobDetails": False,
-        }
-        jobs_fb, meta_fb = execute_apify_run(fallback_payload, params, "Fallback", run_metadata)
-        if jobs_fb:
-            jobs_1 = jobs_fb
-            meta_1 = meta_fb
+        if run_metadata.get("apify_usage_limited"):
+            print("[APIFY FALLBACK] Skipped: Apify account monthly usage hard limit reached (HTTP 403).")
+        else:
+            print()
+            print("[APIFY FALLBACK] startUrls yielded 0 jobs. Running direct search queries fallback...")
+            fallback_payload = {
+                "searchQuery": "AI Engineer",
+                "searchQueries": [
+                    "AI Engineer",
+                    "Machine Learning Engineer",
+                    "Generative AI Engineer",
+                    "LLM Engineer",
+                    "AI Intern",
+                ],
+                "locations": ["Bangalore", "Hyderabad", "Pune", "Mumbai", "Remote"],
+                "location": "India",
+                "maxItems": 50,
+                "maxJobs": 50,
+                "datePosted": "r86400",
+                "sortBy": "DD",
+                "scrapeJobDetails": False,
+            }
+            jobs_fb, meta_fb = execute_apify_run(fallback_payload, params, "Fallback", run_metadata)
+            if jobs_fb:
+                jobs_1 = jobs_fb
+                meta_1 = meta_fb
 
     summary_1 = inspect_and_log_jobs(
         jobs_1,
@@ -1249,7 +1264,7 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
     # PAUSE & LIVE RUN 2 (COMPARISON TEST)
     # --------------------------------------------------------
     enable_compare = os.environ.get("APIFY_COMPARE_RUNS", "false").lower() == "true"
-    if enable_compare:
+    if enable_compare and not run_metadata.get("apify_usage_limited"):
         sleep_seconds = int(os.environ.get("APIFY_COMPARE_DELAY_SECONDS", "120"))
         print()
         print("=" * 80)
@@ -1405,7 +1420,12 @@ def search_jobs(
                 raw = search_jobs_apify(run_metadata)
             else:
                 return "linkedin", "LinkedIn (Apify)", [], "UNAVAILABLE", round(time.time() - t_li, 2), "APIFY_API_TOKEN not configured"
-            status = "OK" if raw else "EMPTY"
+            if run_metadata.get("apify_usage_limited"):
+                status = "APIFY_USAGE_LIMITED"
+            elif raw:
+                status = "OK"
+            else:
+                status = "EMPTY"
             return "linkedin", "LinkedIn", raw, status, round(time.time() - t_li, 2), None
         except Exception as error:
             err_msg = f"{type(error).__name__}: {str(error)}"
@@ -1634,11 +1654,14 @@ def process_jobs_freshness_and_state(
                     f"'{job.get('companyName') or job.get('company')}'"
                 )
 
-            # If match decision is already known, reuse it rather than calling Groq again
-            if existing_record.get("match_score") is not None:
+            # Only reuse prior match score if the job was ALREADY qualified and waiting for email retry
+            # Never bypass AI matching on re-evaluating rejected or un-scored discovered candidates!
+            if prev_status in ("qualified", "email_failed") and existing_record.get("match_score", 0) >= MIN_MATCH_SCORE:
                 job["match_score"] = existing_record.get("match_score")
                 job["qualification"] = existing_record.get("qualification", "GOOD_MATCH")
                 job["priority"] = existing_record.get("priority", "HIGH")
+                job["matcher_path"] = existing_record.get("matcher_path", "CACHED")
+                job["groq_status"] = existing_record.get("groq_status", "PREVIOUSLY_QUALIFIED")
                 job["_already_scored"] = True
         else:
             print(
@@ -1725,6 +1748,11 @@ def score_and_rank_jobs(
     unscored_candidates = [j for j in candidates if not j.get("_already_scored")]
     already_scored_candidates = [j for j in candidates if j.get("_already_scored")]
 
+    for j in already_scored_candidates:
+        title = j.get("title", "Unknown")
+        comp = j.get("companyName") or j.get("company") or "Unknown"
+        print(f"  [PRE-QUALIFIED RETRY] '{title}' @ '{comp}' (Score: {j.get('match_score')}, Path: CACHED)")
+
     scored_new = []
     if unscored_candidates:
         print()
@@ -1743,6 +1771,8 @@ def score_and_rank_jobs(
                     seen_jobs[jid]["qualification"] = j.get("qualification", "MODERATE_MATCH")
                     seen_jobs[jid]["priority"] = j.get("priority", "LOW")
                     seen_jobs[jid]["reason"] = j.get("reason", "")
+                    seen_jobs[jid]["matcher_path"] = j.get("matcher_path", "LOCAL")
+                    seen_jobs[jid]["groq_status"] = j.get("groq_status", "UNKNOWN")
                     if score < MIN_MATCH_SCORE:
                         seen_jobs[jid]["status"] = "rejected"
                         seen_jobs[jid]["reason"] = f"score_below_threshold: {score} < {MIN_MATCH_SCORE}"
@@ -1766,6 +1796,33 @@ def score_and_rank_jobs(
     run_metadata["high_priority_jobs"] = sum(
         1 for j in matched_jobs if j.get("priority") == "HIGH"
     )
+
+    # TASK D: Exact Matcher Diagnostics per Candidate (Non-sensitive)
+    print()
+    print("=" * 70)
+    print("MATCHER CANDIDATE DIAGNOSTICS")
+    print("=" * 70)
+    for j in all_scored:
+        c_title = j.get("title", "Unknown")
+        c_comp = j.get("companyName") or j.get("company") or "Unknown"
+        c_loc = j.get("location", "Unknown")
+        c_path = j.get("matcher_path", "LOCAL")
+        c_groq = j.get("groq_status", "N/A")
+        c_local_score = j.get("local_score", "N/A")
+        c_score = j.get("match_score", 0)
+        c_is_match = c_score >= MIN_MATCH_SCORE
+        c_decision = "MATCHED" if c_is_match else "REJECTED"
+        c_rej_reason = "N/A (Met threshold)" if c_is_match else f"Score {c_score} < {MIN_MATCH_SCORE} threshold"
+
+        print(
+            f"  [CANDIDATE] '{c_title}' @ '{c_comp}'\n"
+            f"              Location:        '{c_loc}'\n"
+            f"              Matcher Path:    {c_path}\n"
+            f"              Groq Status:     {c_groq}\n"
+            f"              Local Score:     {c_local_score}\n"
+            f"              Final Decision:  {c_decision} (Score: {c_score}/100)\n"
+            f"              Rejection Reason:{c_rej_reason}"
+        )
 
     print()
     print(
@@ -2496,6 +2553,8 @@ def print_run_summary(run_metadata: dict, start_time: datetime, end_time: dateti
         err = stat.get("error", "")
         if err:
             details = f"error: {err[:40]} ({elapsed}s)"
+        elif status == "APIFY_USAGE_LIMITED":
+            details = f"monthly usage limit exceeded ({elapsed}s)"
         elif status in ("LIMITED", "UNAVAILABLE"):
             details = f"requires auth / no open feed ({elapsed}s)"
         else:
