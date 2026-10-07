@@ -8,6 +8,9 @@ from job_matcher import (
     classify_priority,
     sanitize_untrusted_text,
     build_batch_prompt,
+    extract_json,
+    normalize_batch_results,
+    local_fallback_results,
 )
 from sources import (
     normalize_url,
@@ -38,6 +41,8 @@ from main import (
     build_email_digest,
     format_source_name,
     send_email_report,
+    execute_apify_run,
+    search_jobs_apify,
 )
 from filters import (
     is_company_excluded,
@@ -2067,9 +2072,299 @@ for target_count in test_counts:
 print("Verified: End-to-end counts for 3, 20, 30, 47, and 80 jobs preserved without ANY arbitrary truncation!")
 
 
+# ======================================================================
+# TESTS 31 - 37: LIVE REGRESSION & ROBUSTNESS TESTS (TASKS A - F)
+# ======================================================================
+
 print()
 print("=" * 70)
-print("ALL 30 TEST SUITES (INCLUDING TESTS 26-30) PASSED WITH 100% SUCCESS!")
+print("TEST 31: 3 DETERMINISTIC CANDIDATES -> 3 MATCHER CANDIDATES (TASK A)")
+print("=" * 70)
+
+# Simulate the exact condition from the live run:
+# 3 jobs survive deterministic filters.
+# 1 job was previously recorded in persistent state as 'rejected' from a prior run.
+# Prior bug: The rejected job was marked _already_scored=True, causing unscored_candidates=2 (3 -> 2 disappearance).
+# Fixed behavior: All 3 candidates are evaluated by the matcher!
+
+job_31_a = {
+    "_job_id": "job_31_001",
+    "title": "Junior AI Engineer",
+    "companyName": "AI Lab A",
+    "location": "Bengaluru, Karnataka, India",
+    "description": "Python, PyTorch, LLMs, RAG. 0-2 years experience.",
+    "url": "https://example.com/job/31/1",
+    "source": "ashby",
+    "postedAt": "10 minutes ago",
+}
+job_31_b = {
+    "_job_id": "job_31_002",
+    "title": "Machine Learning Intern",
+    "companyName": "AI Lab B",
+    "location": "Hyderabad, Telangana, India",
+    "description": "Python, TensorFlow, Scikit-learn. Freshers welcome.",
+    "url": "https://example.com/job/31/2",
+    "source": "greenhouse",
+    "postedAt": "20 minutes ago",
+}
+job_31_c = {
+    "_job_id": "job_31_003",
+    "title": "Generative AI Engineer",
+    "companyName": "AI Lab C",
+    "location": "Remote",
+    "description": "Python, LangChain, Vector Databases, FastAPI.",
+    "url": "https://example.com/job/31/3",
+    "source": "lever",
+    "postedAt": "30 minutes ago",
+}
+
+state_31 = {
+    "jobs": {
+        # job_31_c was previously seen and marked rejected with a low score
+        "job_31_003": {
+            "job_id": "job_31_003",
+            "title": "Generative AI Engineer",
+            "status": "rejected",
+            "match_score": 35,
+            "reason": "score_below_threshold: 35 < 50",
+        }
+    }
+}
+meta_31 = {
+    "jobs_retrieved": 3,
+    "jobs_within_freshness_window": 3,
+    "stale_jobs_filtered": 0,
+    "duplicates_skipped": 0,
+    "email_retries": 0,
+    "new_fresh_jobs": 2,
+    "eligible_jobs": 0,
+    "high_match_jobs": 0,
+    "high_priority_jobs": 0,
+    "candidates_surviving_filter": 0,
+}
+
+now_31 = datetime.now(timezone.utc)
+eligible_31 = process_jobs_freshness_and_state([job_31_a, job_31_b, job_31_c], state_31, now_31, meta_31)
+assert len(eligible_31) == 3, f"Expected 3 eligible jobs, got {len(eligible_31)}"
+
+# Pass through deterministic filters
+comp_31 = filter_jobs_by_company(eligible_31, state=state_31, run_metadata=meta_31)
+exp_31 = filter_jobs_by_experience(comp_31, state=state_31, run_metadata=meta_31)
+loc_31 = filter_jobs_by_strict_location(exp_31, state=state_31, run_metadata=meta_31)
+role_31 = filter_jobs_by_role(loc_31, state=state_31, run_metadata=meta_31)
+assert len(role_31) == 3, f"Expected 3 candidates surviving deterministic filters, got {len(role_31)}"
+
+# CRITICAL CHECK: None of the jobs should be incorrectly flagged as _already_scored
+# because job_31_c was previously 'rejected', NOT 'qualified' or 'email_failed'!
+for j in role_31:
+    assert not j.get("_already_scored"), f"Job '{j.get('title')}' unexpectedly marked _already_scored=True!"
+
+# Now score and rank
+matched_31 = score_and_rank_jobs(role_31, meta_31, state=state_31)
+assert meta_31["candidates_surviving_filter"] == 3, f"Expected 3 candidates surviving filter, got {meta_31['candidates_surviving_filter']}"
+assert len(matched_31) == 3, f"Expected all 3 valid AI candidates to match, got {len(matched_31)}"
+print("  [PASSED] Test 31: 3 deterministic candidates correctly reached matcher; zero candidates disappeared!")
+
+
+print()
+print("=" * 70)
+print("TEST 32: GROQ HTTP 200 WITH NORMAL CLEAN JSON (TASK B)")
+print("=" * 70)
+
+clean_json_str = json.dumps([
+    {
+        "job_index": 1,
+        "match_score": 88,
+        "qualification": "STRONG_MATCH",
+        "experience_fit": "EXCELLENT",
+        "technical_fit": 90,
+        "role_fit": 85,
+        "key_matches": ["Python", "PyTorch", "LLMs"],
+        "missing_requirements": [],
+        "concerns": [],
+        "reason": "Outstanding match for entry-level AI engineer."
+    }
+])
+extracted_32 = extract_json(clean_json_str)
+normalized_32 = normalize_batch_results(extracted_32)
+assert len(normalized_32) == 1
+assert normalized_32[0]["match_score"] == 88
+print("  [PASSED] Test 32: Normal clean JSON parsed and normalized successfully.")
+
+
+print()
+print("=" * 70)
+print("TEST 33: GROQ HTTP 200 WITH FENCED JSON (TASK B)")
+print("=" * 70)
+
+fenced_json_str = f"```json\n{clean_json_str}\n```"
+extracted_33 = extract_json(fenced_json_str)
+normalized_33 = normalize_batch_results(extracted_33)
+assert len(normalized_33) == 1
+assert normalized_33[0]["match_score"] == 88
+print("  [PASSED] Test 33: Fenced JSON (```json ... ```) safely extracted and parsed.")
+
+
+print()
+print("=" * 70)
+print("TEST 34: GROQ HTTP 200 WITH SURROUNDING PROSE & DICT WRAPPER (TASK B)")
+print("=" * 70)
+
+prose_fenced_wrapper = """
+Here is the batch evaluation for the provided candidates:
+
+```json
+{
+  "evaluations": [
+    {
+      "job_index": 1,
+      "match_score": 91,
+      "qualification": "STRONG_MATCH",
+      "experience_fit": "GOOD",
+      "technical_fit": 95,
+      "role_fit": 90,
+      "key_matches": ["Python", "LangChain", "FastAPI"],
+      "missing_requirements": [],
+      "concerns": [],
+      "reason": "Strong match for GenAI agent development."
+    },
+    {
+      "job_index": 2,
+      "match_score": 78,
+      "qualification": "GOOD_MATCH",
+      "experience_fit": "MODERATE",
+      "technical_fit": 80,
+      "role_fit": 75,
+      "key_matches": ["TensorFlow", "Scikit-learn"],
+      "missing_requirements": [],
+      "concerns": [],
+      "reason": "Good foundational ML role."
+    }
+  ]
+}
+```
+
+Please let me know if you need any adjustments to these evaluations!
+"""
+extracted_34 = extract_json(prose_fenced_wrapper)
+normalized_34 = normalize_batch_results(extracted_34)
+assert len(normalized_34) == 2, f"Expected 2 jobs extracted from wrapper, got {len(normalized_34)}"
+assert normalized_34[0]["match_score"] == 91
+assert normalized_34[1]["match_score"] == 78
+print("  [PASSED] Test 34: Surrounding prose and dict-wrapped evaluations successfully parsed.")
+
+
+print()
+print("=" * 70)
+print("TEST 35: INVALID GROQ JSON -> LOCAL FALLBACK PRESERVES ALL CANDIDATES (TASK B & C)")
+print("=" * 70)
+
+# Simulate Groq returning broken text
+broken_text = "I am an AI and I cannot evaluate these jobs right now because of server overload."
+try:
+    extract_json(broken_text)
+    assert False, "Should have raised ValueError on invalid JSON"
+except ValueError as val_err:
+    assert "Model did not return valid JSON" in str(val_err)
+
+# Test local fallback execution directly
+sample_candidates = [
+    {
+        "_job_id": "test_35_1",
+        "title": "AI Engineer",
+        "companyName": "Startup A",
+        "location": "Bengaluru, India",
+        "description": "Python, PyTorch, LLMs.",
+    },
+    {
+        "_job_id": "test_35_2",
+        "title": "Machine Learning Engineer",
+        "companyName": "Startup B",
+        "location": "Remote",
+        "description": "Python, TensorFlow, Docker.",
+    },
+]
+fallback_res = local_fallback_results(sample_candidates, fallback_reason="Simulated Groq Failure")
+assert len(fallback_res) == 2, f"Expected 2 jobs from local fallback, got {len(fallback_res)}"
+for fb_j in fallback_res:
+    assert fb_j.get("matcher_path") == "LOCAL"
+    assert fb_j.get("match_score", 0) >= 50, f"Expected valid AI job to meet 50+ threshold in fallback, got {fb_j.get('match_score')}"
+print("  [PASSED] Test 35: Invalid Groq JSON safely falls back to local scoring and preserves ALL candidates.")
+
+
+print()
+print("=" * 70)
+print("TEST 36: LOCAL FALLBACK PRODUCES MATCHES FOR VALID CANDIDATES (TASK C)")
+print("=" * 70)
+
+# Verify each common AI title recognized by deterministic filters scores >= 50
+test_titles = [
+    "AI Engineer",
+    "Machine Learning Engineer",
+    "Generative AI Engineer",
+    "LLM Engineer",
+    "AI Developer",
+    "Machine Learning Intern",
+    "AI Intern",
+    "Applied AI Engineer",
+    "Junior AI Engineer",
+]
+
+for t in test_titles:
+    job_t = {
+        "title": t,
+        "companyName": "Tech Co",
+        "location": "Bengaluru, Karnataka, India",
+        "description": "Looking for entry-level talent with Python and deep learning foundations.",
+    }
+    score_res = local_score_job(job_t)
+    l_score = score_res["local_score"]
+    assert l_score >= 50, f"Role '{t}' scored {l_score} < 50 threshold in local scoring! Reasons: {score_res['local_reasons']}"
+    print(f"  [VERIFIED] '{t}': Local score = {l_score}/100 (Passes >= 50)")
+
+print("  [PASSED] Test 36: Local fallback reliably scores valid AI candidates >= 50 without arbitrarily lowering threshold.")
+
+
+print()
+print("=" * 70)
+print("TEST 37: APIFY HTTP 403 MONTHLY USAGE LIMIT HANDLING (TASK 1)")
+print("=" * 70)
+
+from unittest.mock import patch, MagicMock
+
+# Simulate Apify HTTP 403 response
+mock_403_res = MagicMock()
+mock_403_res.status_code = 403
+mock_403_res.text = json.dumps({
+    "error": {
+        "type": "platform-feature-disabled",
+        "message": "Monthly usage hard limit exceeded"
+    }
+})
+mock_403_res.headers = {}
+
+meta_37 = {"scraper_errors": []}
+with patch("requests.post", return_value=mock_403_res):
+    jobs_out, run_info = execute_apify_run({}, {}, "Test 403", meta_37)
+    assert jobs_out == []
+    assert meta_37.get("apify_usage_limited") is True
+    assert run_info.get("usage_limited") is True
+
+# Verify search_jobs_apify does NOT call fallback when apify_usage_limited is True
+with patch("main.APIFY_TOKEN", "mock_token"), patch("main.execute_apify_run") as mock_exec:
+    mock_exec.return_value = ([], {"usage_limited": True})
+    meta_37_b = {"scraper_errors": [], "apify_usage_limited": True}
+    res_jobs = search_jobs_apify(meta_37_b)
+    assert res_jobs == []
+    # execute_apify_run should only have been called ONCE (Run 1), not for Fallback or Run 2!
+    assert mock_exec.call_count == 1, f"Expected execute_apify_run called 1 time, got {mock_exec.call_count}"
+
+print("  [PASSED] Test 37: Apify 403 correctly marked APIFY_USAGE_LIMITED; redundant fallback eliminated.")
+
+
+print()
+print("=" * 70)
+print("ALL 37 TEST SUITES (INCLUDING TESTS 31-37) PASSED WITH 100% SUCCESS!")
 print("=" * 70)
 
 

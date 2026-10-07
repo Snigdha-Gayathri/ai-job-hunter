@@ -19,6 +19,21 @@ except ImportError:
     GROQ_BATCH_SIZE = 15
     MIN_MATCH_SCORE = 50
 
+try:
+    from filters import (
+        AI_ROLE_COMPILED,
+        AI_ROLE_PATTERNS,
+        AI_TITLE_KEYWORDS,
+        AI_TOKEN_IN_TITLE_RE,
+        is_role_relevant,
+    )
+except ImportError:
+    AI_ROLE_COMPILED = []
+    AI_ROLE_PATTERNS = []
+    AI_TITLE_KEYWORDS = []
+    AI_TOKEN_IN_TITLE_RE = None
+    is_role_relevant = None
+
 # Local filtering keywords.
 AI_ROLE_KEYWORDS = {
     "ai engineer",
@@ -40,6 +55,8 @@ AI_ROLE_KEYWORDS = {
     "applied ai engineer",
     "applied ai",
     "ai research engineer",
+    "ai research scientist",
+    "ai scientist",
     "deep learning",
     "nlp engineer",
     "nlp",
@@ -49,8 +66,19 @@ AI_ROLE_KEYWORDS = {
     "ai/ml",
     "ai / ml",
     "ai software engineer",
+    "ai developer",
+    "ml developer",
+    "generative ai developer",
+    "genai developer",
+    "ai solutions engineer",
+    "ai platform engineer",
+    "ai product engineer",
+    "applied scientist",
+    "prompt engineer",
     "junior ai engineer",
     "associate ai engineer",
+    "graduate ai engineer",
+    "graduate ml engineer",
     "ai engineer intern",
     "ml engineer intern",
     "machine learning intern",
@@ -62,7 +90,11 @@ AI_ROLE_KEYWORDS = {
     "applied ai intern",
     "ai research intern",
     "ai intern",
+    "ml intern",
     "ai/ml intern",
+    "ai trainee",
+    "ml trainee",
+    "ai code trainer",
 }
 
 def sanitize_untrusted_text(text: str) -> str:
@@ -238,39 +270,101 @@ def extract_json(text: str) -> Any:
 
     Handles:
     - plain JSON
-    - markdown code fences
-    - extra text surrounding the JSON
+    - markdown code fences (```json ... ``` or ``` ... ```)
+    - extra prose preceding or trailing the JSON
+    - outermost JSON array [...] or outermost JSON object {...}
+    - nested or sub-blocks within fenced text
     """
+    if not text or not isinstance(text, str):
+        raise ValueError("Empty or invalid response received from model.")
 
-    text = text.strip()
+    raw = text.strip()
 
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?", "", text)
-        text = re.sub(r"```$", "", text)
-        text = text.strip()
-
-    # First try parsing the complete response.
+    # 1. Attempt direct json.loads on entire response
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
+        return json.loads(raw)
+    except Exception:
         pass
 
-    # Fall back to locating the first JSON object/array.
-    object_start = text.find("{")
-    object_end = text.rfind("}")
+    # 2. Extract fenced code blocks: ```json ... ``` or ``` ... ```
+    fence_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
+    for match in re.findall(fence_pattern, raw, re.IGNORECASE):
+        candidate = match.strip()
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
 
-    if object_start != -1 and object_end != -1:
-        return json.loads(text[object_start:object_end + 1])
+    # 3. Strip leading/trailing code fence delimiters
+    cleaned = re.sub(r"^```(?:json)?", "", raw, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
 
-    array_start = text.find("[")
-    array_end = text.rfind("]")
+    # 4. Outermost JSON array: [ ... ]
+    # We check array FIRST because batch job matching expects a list of evaluations
+    arr_start = raw.find("[")
+    arr_end = raw.rfind("]")
+    if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+        candidate = raw[arr_start : arr_end + 1].strip()
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
 
-    if array_start != -1 and array_end != -1:
-        return json.loads(text[array_start:array_end + 1])
+    # 5. Outermost JSON object: { ... }
+    obj_start = raw.find("{")
+    obj_end = raw.rfind("}")
+    if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+        candidate = raw[obj_start : obj_end + 1].strip()
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    # 6. Check inside fenced blocks for arrays or objects
+    for match in re.findall(fence_pattern, raw, re.IGNORECASE):
+        fenced = match.strip()
+        f_arr_start = fenced.find("[")
+        f_arr_end = fenced.rfind("]")
+        if f_arr_start != -1 and f_arr_end != -1 and f_arr_end > f_arr_start:
+            try:
+                return json.loads(fenced[f_arr_start : f_arr_end + 1].strip())
+            except Exception:
+                pass
+        f_obj_start = fenced.find("{")
+        f_obj_end = fenced.rfind("}")
+        if f_obj_start != -1 and f_obj_end != -1 and f_obj_end > f_obj_start:
+            try:
+                return json.loads(fenced[f_obj_start : f_obj_end + 1].strip())
+            except Exception:
+                pass
 
     raise ValueError(
-        f"Model did not return valid JSON:\n{text[:3000]}"
+        f"Model did not return valid JSON:\n{raw[:1500]}"
     )
+
+
+def normalize_batch_results(raw_json: Any) -> list[dict]:
+    """
+    Ensure the extracted JSON is a list of job evaluation dictionaries.
+    Handles:
+    - list of dicts: [ {...}, {...} ]
+    - dict wrapping a list: {"evaluations": [...]}, {"jobs": [...]}, {"results": [...]}
+    - single dict evaluation: {"job_index": 1, ...} -> [ {"job_index": 1, ...} ]
+    """
+    if isinstance(raw_json, list):
+        return [item for item in raw_json if isinstance(item, dict)]
+    elif isinstance(raw_json, dict):
+        for key in ("evaluations", "jobs", "results", "matches", "data", "candidates", "evaluations_list"):
+            val = raw_json.get(key)
+            if isinstance(val, list):
+                return [item for item in val if isinstance(item, dict)]
+        if any(k in raw_json for k in ("job_index", "match_score", "qualification", "technical_fit")):
+            return [raw_json]
+    return []
 
 
 def get_job_text(job: dict) -> str:
@@ -298,31 +392,35 @@ def get_job_text(job: dict) -> str:
 
 def local_score_job(job: dict) -> dict:
     """
-    Cheap deterministic pre-filter.
-
-    This function performs ZERO API calls.
-
-    It exists to prevent irrelevant jobs from reaching Groq.
+    Deterministic scoring engine (used for pre-filtering and when Groq is unavailable).
+    Scores candidates based on title match, technical overlap, fresher alignment,
+    location, and penalties for senior roles or foreign on-site.
     """
-
     title = str(job.get("title") or "").lower()
     text = get_job_text(job)
 
     score = 0
     reasons = []
 
-    # Strong signal: title is directly related to AI/ML.
+    # 1. Strong signal: title is directly related to AI/ML.
     title_matches = [
         keyword
         for keyword in AI_ROLE_KEYWORDS
         if keyword in title
     ]
+    has_compiled_title_match = False
+    if AI_ROLE_COMPILED:
+        has_compiled_title_match = any(pattern.search(title) for pattern in AI_ROLE_COMPILED)
 
-    if title_matches:
+    if title_matches or has_compiled_title_match:
         score += 45
         reasons.append("AI/ML role detected in title")
+    elif is_role_relevant and is_role_relevant(title, text)[0]:
+        # Title is broader (e.g. Software Engineer, MTS), but description strongly focuses on AI/ML
+        score += 35
+        reasons.append("AI/ML specialization confirmed by description")
 
-    # Technical overlap.
+    # 2. Technical overlap (up to 35 points)
     technical_matches = [
         keyword
         for keyword in TECHNICAL_KEYWORDS
@@ -337,7 +435,7 @@ def local_score_job(job: dict) -> dict:
             f"{len(technical_matches)} relevant technical signals"
         )
 
-    # Fresher-friendly language.
+    # 3. Fresher-friendly language (+15 points)
     fresher_matches = [
         keyword
         for keyword in FRESHER_TERMS
@@ -348,7 +446,7 @@ def local_score_job(job: dict) -> dict:
         score += 15
         reasons.append("Entry-level/fresher language detected")
 
-    # Seniority penalty.
+    # 4. Seniority penalty (-70 points)
     senior_matches = [
         keyword
         for keyword in SENIOR_TERMS
@@ -359,7 +457,7 @@ def local_score_job(job: dict) -> dict:
         score -= 70
         reasons.append("Senior-level title detected")
 
-    # Explicit high experience requirement.
+    # 5. Explicit high experience requirement (-25 points)
     experience_patterns = [
         r"\b([5-9]|[1-9][0-9])\+?\s*years?\b",
         r"\b([5-9]|[1-9][0-9])\s*-\s*([5-9]|[1-9][0-9])\s*years?\b",
@@ -374,7 +472,7 @@ def local_score_job(job: dict) -> dict:
         score -= 25
         reasons.append("High experience requirement detected")
 
-    # Location and remote eligibility
+    # 6. Location and remote eligibility
     location_str = str(job.get("location") or "").lower()
     remote_type = str(job.get("remote_type") or "").lower()
     is_remote = (
@@ -400,7 +498,6 @@ def local_score_job(job: dict) -> dict:
         reasons.append("Non-India onsite location detected")
 
     score = max(0, min(score, 100))
-
 
     return {
         "local_score": score,
@@ -730,16 +827,24 @@ def score_single_batch(jobs: list[dict]) -> list[dict]:
         response.raise_for_status()
         data = response.json()
         content = data["choices"][0]["message"]["content"]
-        results = extract_json(content)
+        raw_results = extract_json(content)
+        results = normalize_batch_results(raw_results)
 
-        if not isinstance(results, list):
-            raise ValueError("Groq returned JSON, but not a JSON array.")
+        if not results:
+            raise ValueError(
+                f"Groq returned valid JSON, but no candidate evaluation objects could be extracted. "
+                f"Content preview: {content[:300]}"
+            )
 
         return merge_ai_results(jobs, results)
 
     except Exception as error:
         print(f"Groq batch matching failed: {error}. Falling back to local scoring.")
-        return local_fallback_results(jobs)
+        return local_fallback_results(
+            jobs,
+            fallback_reason=f"Groq batch matching failed ({error}); local scoring used.",
+            groq_status=f"FAILED: {error}",
+        )
 
 
 def score_jobs_batch(jobs: list[dict], batch_size: int = GROQ_BATCH_SIZE) -> list[dict]:
@@ -780,6 +885,7 @@ def merge_ai_results(
 ) -> list[dict]:
     """
     Attach AI results to the original job objects.
+    Preserves all input jobs.
     """
 
     result_by_index = {}
@@ -798,29 +904,37 @@ def merge_ai_results(
 
         if not result:
             print(
-                f"Missing AI result for job {index}. "
-                f"Using local score."
+                f"Missing AI result for job {index} ('{job.get('title')}'). "
+                f"Using local score fallback."
             )
+            if "local_score" not in job:
+                res = local_score_job(job)
+                job["local_score"] = res["local_score"]
+                job["local_reasons"] = res["local_reasons"]
+                job["technical_matches"] = res.get("technical_matches", [])
+
+            l_score = job.get("local_score", 0)
             result = {
-                "match_score": job.get("local_score", 0),
-                "qualification": "MODERATE_MATCH",
+                "match_score": l_score,
+                "qualification": "GOOD_MATCH" if l_score >= 70 else ("MODERATE_MATCH" if l_score >= 50 else "WEAK_MATCH"),
                 "experience_fit": "MODERATE",
-                "technical_fit": job.get("local_score", 0),
-                "role_fit": job.get("local_score", 0),
-                "key_matches": job.get(
-                    "local_reasons",
-                    [],
-                ),
+                "technical_fit": l_score,
+                "role_fit": l_score,
+                "key_matches": job.get("local_reasons", []),
                 "missing_requirements": [],
                 "concerns": [
-                    "AI result unavailable for this job."
+                    "AI result unavailable for this job in batch."
                 ],
                 "reason": (
-                    "Ranked using local fallback scoring "
-                    "because the batch AI response did not "
-                    "contain a result for this job."
+                    f"Ranked using local fallback scoring ({l_score}/100) "
+                    "because batch AI response omitted result for this job index."
                 ),
             }
+            job["matcher_path"] = "LOCAL"
+            job["groq_status"] = "PARTIAL_LOCAL_FALLBACK"
+        else:
+            job["matcher_path"] = "GROQ"
+            job["groq_status"] = "SUCCESS"
 
         job["match_score"] = safe_int(
             result.get(
@@ -874,12 +988,13 @@ def merge_ai_results(
 
 def local_fallback_results(
     jobs: list[dict],
+    fallback_reason: str = "AI batch matcher unavailable; local scoring used.",
+    groq_status: str = "FALLBACK",
 ) -> list[dict]:
     """
     Produce usable results without Groq.
 
-    This guarantees that a 429 does not become:
-        0 jobs found
+    This guarantees that an AI API issue does not result in 0 jobs found.
     """
 
     results = []
@@ -898,6 +1013,8 @@ def local_fallback_results(
         elif score >= 75:
             qualification = "GOOD_MATCH"
         elif score >= 60:
+            qualification = "MODERATE_MATCH"
+        elif score >= 50:
             qualification = "MODERATE_MATCH"
         else:
             qualification = "WEAK_MATCH"
@@ -925,15 +1042,13 @@ def local_fallback_results(
             [],
         )
         job["missing_requirements"] = []
-        job["concerns"] = [
-            "AI batch matcher unavailable; "
-            "local scoring used."
-        ]
+        job["concerns"] = [fallback_reason]
         job["match_reason"] = (
-            "This job passed the local AI/ML relevance "
-            "filter and was ranked using deterministic "
-            "candidate-skill and role matching."
+            f"Deterministic match: score {score}/100. "
+            f"{', '.join(job.get('local_reasons', [])) or 'Passed AI/ML relevance filter.'}"
         )
+        job["matcher_path"] = "LOCAL"
+        job["groq_status"] = groq_status
 
         results.append(job)
 
