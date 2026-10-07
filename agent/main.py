@@ -624,6 +624,7 @@ def parse_posted_time(
 def calculate_freshness(
     job: dict,
     discovered_at: datetime,
+    window_minutes: int | None = None,
 ) -> dict:
     """
     Calculate job age, discovery latency, and freshness window eligibility.
@@ -684,12 +685,15 @@ def calculate_freshness(
         age_str = f"{days} days"
 
     # Source-specific freshness window:
-    # LinkedIn: fast-stream window (default 90m for hourly freshness, configurable)
-    # ATS and Remote boards: active posting window (48 hours = 2880m)
-    if source_name in ("greenhouse", "lever", "ashby", "remoteok", "remotive", "workingnomads", "weworkremotely", "nodesk"):
+    # If window_minutes is explicitly passed, use it.
+    # Otherwise: ATS & remote boards use active posting window (default 48 hours = 2880m).
+    # LinkedIn & general fast feeds use sensible 24-hour window (1440m).
+    if window_minutes is not None:
+        source_window_minutes = window_minutes
+    elif source_name in ("greenhouse", "lever", "ashby", "remoteok", "remotive", "workingnomads", "weworkremotely", "nodesk"):
         source_window_minutes = int(os.environ.get("ATS_FRESHNESS_WINDOW_MINUTES", "2880"))
     else:
-        source_window_minutes = FRESHNESS_WINDOW_MINUTES
+        source_window_minutes = int(os.environ.get("FRESHNESS_WINDOW_MINUTES", str(FRESHNESS_WINDOW_MINUTES)))
 
     # Enforce freshness window
     # Allow small negative latency (up to -5 mins) for minor server clock desync
@@ -802,19 +806,29 @@ def execute_apify_run(
 ) -> tuple[list[dict], dict]:
     """
     Executes a single live request to the Apify LinkedIn scraper actor.
-    Captures timing, HTTP status, and response headers (including actor run ID).
+    Handles:
+    - Synchronous dataset return (HTTP 200 list)
+    - Asynchronous / timeout return (HTTP 201 Created with run metadata)
+    - Polling in-progress run (RUNNING / READY) until completion
+    - Fetching dataset items directly from defaultDatasetId
+    - Clean non-secret diagnostic logging
     """
     start_dt = datetime.now(timezone.utc)
     t0 = time.time()
 
+    exec_params = dict(params)
+    if "timeout" not in exec_params:
+        exec_params["timeout"] = int(os.environ.get("APIFY_TIMEOUT_SECONDS", "120"))
+
     print()
-    print(f"[{label}] Starting live Apify invocation at {format_ist_and_utc(start_dt)}...")
-    print(f"[{label}] Actor URL: {APIFY_URL}")
+    print(f"[{label}] Starting Apify invocation at {format_ist_and_utc(start_dt)}...")
+    print(f"[{label}] Actor: {ACTOR_ID} | Endpoint: {APIFY_URL}")
+    print(f"[{label}] Submitted startUrls: {len(payload.get('startUrls', []))}")
 
     try:
         response = requests.post(
             APIFY_URL,
-            params=params,
+            params=exec_params,
             json=payload,
             timeout=240,
         )
@@ -867,21 +881,91 @@ def execute_apify_run(
         }
 
     jobs = []
+    run_status = "UNKNOWN"
+
     if isinstance(data, list):
         jobs = data
+        run_status = "SUCCEEDED"
+        print(f"[{label}] Direct dataset list received: {len(jobs)} items.")
     elif isinstance(data, dict):
-        for key in ("items", "data", "results"):
+        for key in ("items", "results"):
             if isinstance(data.get(key), list):
                 jobs = data[key]
+                run_status = "SUCCEEDED"
                 break
+
+        # Check run object
+        run_obj = data.get("data") if isinstance(data.get("data"), dict) else data
+        run_id = run_obj.get("id") or (actor_run_id if actor_run_id != "Not reported in header" else None)
+        run_status = run_obj.get("status", run_status)
+        if not dataset_id or dataset_id == "Not reported in header":
+            dataset_id = run_obj.get("defaultDatasetId", "Not reported in header")
+
+        # If run is still running or ready, poll until completion
+        token = exec_params.get("token", "")
+        if run_status in ("RUNNING", "READY") and run_id and token:
+            poll_url = f"https://api.apify.com/v2/actor-runs/{run_id}"
+            max_wait = int(os.environ.get("APIFY_POLL_TIMEOUT_SECONDS", "60"))
+            poll_interval = 5
+            elapsed_poll = 0
+            print(f"[{label}] Actor run {run_id} is {run_status}. Polling for completion (max {max_wait}s)...")
+            while run_status in ("RUNNING", "READY") and elapsed_poll < max_wait:
+                time.sleep(poll_interval)
+                elapsed_poll += poll_interval
+                try:
+                    p_res = requests.get(poll_url, params={"token": token}, timeout=15)
+                    if p_res.status_code == 200:
+                        p_data = p_res.json().get("data", {})
+                        run_status = p_data.get("status", run_status)
+                        ds_from_poll = p_data.get("defaultDatasetId")
+                        if ds_from_poll:
+                            dataset_id = ds_from_poll
+                        print(f"[{label}] Polled run {run_id}: status={run_status} ({elapsed_poll}s elapsed)")
+                        if run_status not in ("RUNNING", "READY"):
+                            break
+                except Exception as poll_err:
+                    print(f"[{label}] Polling warning: {poll_err}")
+                    break
+
+        # If jobs still empty and we have a valid dataset_id, fetch items directly
+        if not jobs and dataset_id and dataset_id != "Not reported in header" and token:
+            dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+            print(f"[{label}] Fetching items from Apify dataset {dataset_id}...")
+            try:
+                ds_res = requests.get(
+                    dataset_url,
+                    params={"token": token, "clean": "true", "format": "json"},
+                    timeout=60,
+                )
+                if ds_res.status_code == 200:
+                    ds_data = ds_res.json()
+                    if isinstance(ds_data, list):
+                        jobs = ds_data
+                    elif isinstance(ds_data, dict) and isinstance(ds_data.get("items"), list):
+                        jobs = ds_data["items"]
+                    print(f"[{label}] Successfully retrieved {len(jobs)} items from dataset {dataset_id}.")
+                else:
+                    print(f"[{label}] Dataset items fetch returned HTTP {ds_res.status_code}: {ds_res.text[:300]}")
+            except Exception as ds_err:
+                print(f"[{label}] Dataset items fetch error: {ds_err}")
+
+    print(f"[{label}] Scraper Diagnostics Summary:")
+    print(f"  Actor ID:             {ACTOR_ID}")
+    print(f"  HTTP Status:          {response.status_code}")
+    print(f"  Actor Run ID:         {actor_run_id}")
+    print(f"  Dataset ID:           {dataset_id}")
+    print(f"  Actor/Run Status:     {run_status}")
+    print(f"  Start URLs Submitted: {len(payload.get('startUrls', []))}")
+    print(f"  Jobs Extracted:       {len(jobs)}")
 
     meta = {
         "label": label,
         "start_utc": start_dt.isoformat(),
-        "duration_seconds": duration,
+        "duration_seconds": round(time.time() - t0, 2),
         "status_code": response.status_code,
         "actor_run_id": actor_run_id,
         "dataset_id": dataset_id,
+        "run_status": run_status,
         "total_jobs": len(jobs),
     }
     return jobs, meta
@@ -1073,7 +1157,7 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
         "experienceLevel": "2",  # Entry level
         "datePosted": "r86400",  # Past 24 hours max window
         "sortBy": "DD",  # Most Recent
-        "scrapeJobDetails": True,
+        "scrapeJobDetails": os.environ.get("APIFY_SCRAPE_JOB_DETAILS", "false").lower() == "true",
         "startUrls": [
             {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Engineer&location=Bengaluru&f_TPR=r86400&sortBy=DD"},
             {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Engineer&location=Bengaluru&f_TPR=r86400&sortBy=DD"},
@@ -1099,20 +1183,67 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
     }
 
     print("Search Configuration:")
-    print("  sortBy:        'DD' (Most Recent)")
-    print("  datePosted:    'r86400' (Past 24 hours)")
-    print(f"  startUrls:     {len(payload['startUrls'])} multi-partition URLs (Mumbai, Hyd, Blr, Pune, Remote)")
-    print(f"  searchQueries: {payload['searchQueries']}")
+    print("  sortBy:           'DD' (Most Recent)")
+    print("  datePosted:       'r86400' (Past 24 hours)")
+    print(f"  startUrls:        {len(payload['startUrls'])} multi-partition URLs (Mumbai, Hyd, Blr, Pune, Remote)")
+    print(f"  scrapeJobDetails: {payload['scrapeJobDetails']}")
+    print(f"  searchQueries:    {payload['searchQueries']}")
 
     # --------------------------------------------------------
     # LIVE RUN 1
     # --------------------------------------------------------
     jobs_1, meta_1 = execute_apify_run(payload, params, "Run 1", run_metadata)
+
+    # If startUrls returned 0 items, run fallback direct query to ensure resilience
+    if not jobs_1:
+        print()
+        print("[APIFY FALLBACK] startUrls yielded 0 jobs. Running direct search queries fallback...")
+        fallback_payload = {
+            "searchQuery": "AI Engineer",
+            "searchQueries": [
+                "AI Engineer",
+                "Machine Learning Engineer",
+                "Generative AI Engineer",
+                "LLM Engineer",
+                "AI Intern",
+            ],
+            "locations": ["Bangalore", "Hyderabad", "Pune", "Mumbai", "Remote"],
+            "location": "India",
+            "maxItems": 50,
+            "maxJobs": 50,
+            "datePosted": "r86400",
+            "sortBy": "DD",
+            "scrapeJobDetails": False,
+        }
+        jobs_fb, meta_fb = execute_apify_run(fallback_payload, params, "Fallback", run_metadata)
+        if jobs_fb:
+            jobs_1 = jobs_fb
+            meta_1 = meta_fb
+
     summary_1 = inspect_and_log_jobs(
         jobs_1,
         datetime.now(timezone.utc),
         "Run 1",
     )
+
+    # --------------------------------------------------------
+    # RECORD LINKEDIN METRICS
+    # --------------------------------------------------------
+    fresh_li_count = 0
+    now_utc = datetime.now(timezone.utc)
+    for j in jobs_1:
+        fr = calculate_freshness(j, now_utc)
+        if fr.get("is_fresh"):
+            fresh_li_count += 1
+
+    run_metadata["linkedin_metrics"] = {
+        "partitions_submitted": len(payload.get("startUrls", [])),
+        "partitions_successful": len(payload.get("startUrls", [])) if jobs_1 else 0,
+        "partitions_failed": 0 if jobs_1 else len(payload.get("startUrls", [])),
+        "total_items_returned": len(jobs_1),
+        "total_normalized_jobs": len(jobs_1),
+        "total_fresh_jobs": fresh_li_count,
+    }
 
     # --------------------------------------------------------
     # PAUSE & LIVE RUN 2 (COMPARISON TEST)
@@ -1384,6 +1515,7 @@ def process_jobs_freshness_and_state(
     seen_jobs = state.setdefault("jobs", {})
     eligible_jobs = []
     current_run_seen_ids = set()
+    source_funnel = run_metadata.setdefault("source_funnel", {})
 
     print()
     print("=" * 70)
@@ -1404,6 +1536,9 @@ def process_jobs_freshness_and_state(
         source_name = job.get("source") or job.get("_source_provider") or "linkedin"
         job["source"] = source_name
 
+        sf = source_funnel.setdefault(source_name, {"raw": 0, "stale": 0, "duplicate": 0, "eligible": 0})
+        sf["raw"] += 1
+
         # Prevent duplicate items within the same scrape response
         if job_id in current_run_seen_ids:
             continue
@@ -1422,15 +1557,18 @@ def process_jobs_freshness_and_state(
             job_id = existing_id
             job["_job_id"] = existing_id
 
-        # If already finalized (emailed, rejected, email_abandoned): skip!
+        # Deduplication check:
+        # - "emailed": permanently skip to avoid repeat alert spam!
+        # - "email_abandoned": permanently skip after exceeding max retry attempts.
+        # - "email_failed", "qualified", "discovered", and recent "rejected": retain eligibility!
         if existing_record and existing_record.get("status") in (
             "emailed",
-            "rejected",
             "email_abandoned",
         ):
             run_metadata["duplicates_skipped"] += 1
+            sf["duplicate"] += 1
             existing_record["last_seen"] = discovered_at.isoformat()
-            seen_sources = existing_record.setdefault("seen_sources", [existing_record.get("source", "linkedin")])
+            seen_sources = existing_record.setdefault("seen_sources", [existing_record.get("source", source_name)])
             if source_name not in seen_sources:
                 seen_sources.append(source_name)
             continue
@@ -1441,17 +1579,19 @@ def process_jobs_freshness_and_state(
             if attempts >= 3:
                 existing_record["status"] = "email_abandoned"
                 run_metadata["duplicates_skipped"] += 1
+                sf["duplicate"] += 1
                 print(
                     f"[RETRY ABANDONED] Max email attempts (3) exceeded for "
                     f"'{job.get('title')}' at '{job.get('companyName') or job.get('company')}'"
                 )
                 continue
 
-        # Check for truly obsolete listings (older than 14 days)
+        # Check for truly obsolete listings (older than max_age_days, default 14 days)
         max_age_days = int(os.environ.get("MAX_JOB_AGE_DAYS", "14"))
         latency_mins = freshness.get("discovery_latency_minutes")
         if latency_mins is not None and latency_mins > (max_age_days * 1440):
             run_metadata["stale_jobs_filtered"] += 1
+            sf["stale"] += 1
             print(
                 f"[EXPIRED LISTING] '{job.get('title')}' at "
                 f"'{job.get('companyName') or job.get('company')}' - "
@@ -1459,25 +1599,40 @@ def process_jobs_freshness_and_state(
             )
             continue
 
-        # Job is eligible for evaluation!
+        # Track fresh jobs count
         if freshness["is_fresh"]:
             run_metadata["jobs_within_freshness_window"] += 1
 
-        # 4. Handle Retry vs New Discovery
-        if existing_record and existing_record.get("status") in (
-            "email_failed",
-            "discovered",
-        ):
-            print(
-                f"[RETRY ELIGIBLE] '{job.get('title')}' at "
-                f"'{job.get('companyName') or job.get('company')}' (Prior status: "
-                f"{existing_record.get('status')})"
-            )
-            run_metadata["email_retries"] += 1
+        # 3. Handle Retry vs Re-evaluating vs New Discovery
+        if existing_record:
+            prev_status = existing_record.get("status", "discovered")
             existing_record["last_seen"] = discovered_at.isoformat()
-            seen_sources = existing_record.setdefault("seen_sources", [existing_record.get("source", "linkedin")])
+            seen_sources = existing_record.setdefault("seen_sources", [existing_record.get("source", source_name)])
             if source_name not in seen_sources:
                 seen_sources.append(source_name)
+
+            if prev_status == "email_failed":
+                print(
+                    f"[RETRY ELIGIBLE] '{job.get('title')}' at "
+                    f"'{job.get('companyName') or job.get('company')}' (Prior status: email_failed)"
+                )
+                run_metadata["email_retries"] += 1
+            elif prev_status == "qualified":
+                print(
+                    f"[QUALIFIED RETRY] '{job.get('title')}' at "
+                    f"'{job.get('companyName') or job.get('company')}' (Prior status: qualified)"
+                )
+                run_metadata["email_retries"] += 1
+            elif prev_status == "rejected":
+                print(
+                    f"[RE-EVALUATING] '{job.get('title')}' at "
+                    f"'{job.get('companyName') or job.get('company')}' (Previously marked rejected)"
+                )
+            else:
+                print(
+                    f"[DISCOVERED RETRY] '{job.get('title')}' at "
+                    f"'{job.get('companyName') or job.get('company')}'"
+                )
 
             # If match decision is already known, reuse it rather than calling Groq again
             if existing_record.get("match_score") is not None:
@@ -1526,6 +1681,7 @@ def process_jobs_freshness_and_state(
                 "email_attempts": 0,
             }
 
+        sf["eligible"] += 1
         eligible_jobs.append(job)
 
     print()
@@ -2249,12 +2405,15 @@ def print_run_summary(run_metadata: dict, start_time: datetime, end_time: dateti
     """
     raw_count = run_metadata.get("jobs_retrieved", 0)
     norm_count = raw_count
+    stale_count = run_metadata.get("stale_jobs_filtered", 0)
     new_count = run_metadata.get("eligible_jobs", 0)
     comp_count = run_metadata.get("company_matched_jobs", 0)
     exp_count = run_metadata.get("experience_matched_jobs", 0)
     loc_count = run_metadata.get("location_matched_jobs", 0)
     role_count = run_metadata.get("role_matched_jobs", 0)
-    final_count = run_metadata.get("high_match_jobs", 0)
+    candidates_count = run_metadata.get("candidates_surviving_filter", 0)
+    matched_count = run_metadata.get("high_match_jobs", 0)
+    final_count = matched_count
     emailed_count = run_metadata.get("emails_sent", 0)
     email_failed_count = run_metadata.get("email_failures", 0)
 
@@ -2284,22 +2443,40 @@ def print_run_summary(run_metadata: dict, start_time: datetime, end_time: dateti
     print("-" * 80)
     print("CONCISE FILTERING FUNNEL")
     print("-" * 80)
-    print(f"  RAW:          {raw_count}")
-    print(f"  NORM:         {norm_count}")
-    print(f"  NEW:          {new_count}")
-    print(f"  COMP:         {comp_count}")
-    print(f"  EXP:          {exp_count}")
-    print(f"  LOC:          {loc_count}")
-    print(f"  ROLE:         {role_count}")
-    print(f"  FINAL:        {final_count}")
-    print(f"  EMAILED:      {emailed_count}")
-    print(f"  EMAIL_FAILED: {email_failed_count}")
+    print(f"  RAW:                 {raw_count}")
+    print(f"  NORMALIZED:          {norm_count}")
+    print(f"  STALE:               {stale_count}")
+    print(f"  NEW:                 {new_count}")
+    print(f"  DEDUPLICATED:        {dedup_count}")
+    print(f"  COMPANY_REJECTED:    {comp_rejected}")
+    print(f"  EXPERIENCE_REJECTED: {exp_rejected}")
+    print(f"  LOCATION_REJECTED:   {loc_rejected}")
+    print(f"  ROLE_REJECTED:       {role_rejected}")
+    print(f"  MATCH_CANDIDATES:    {candidates_count}")
+    print(f"  MATCHED:             {matched_count}")
+    print(f"  EMAILED:             {emailed_count}")
+    print(f"  EMAIL_FAILED:        {email_failed_count}")
+    print()
     print(
-        f"Summary: RAW={raw_count} -> NORM={norm_count} -> NEW={new_count} -> "
-        f"COMP={comp_count} -> EXP={exp_count} -> LOC={loc_count} -> "
-        f"ROLE={role_count} -> FINAL={final_count} -> EMAILED={emailed_count} "
-        f"(EMAIL_FAILED={email_failed_count})"
+        f"Summary: RAW={raw_count} -> NORM={norm_count} -> STALE={stale_count} -> "
+        f"NEW={new_count} -> DEDUP={dedup_count} -> COMP={comp_count} -> EXP={exp_count} -> "
+        f"LOC={loc_count} -> ROLE={role_count} -> CANDIDATES={candidates_count} -> "
+        f"MATCHED={matched_count} -> EMAILED={emailed_count} (EMAIL_FAILED={email_failed_count})"
     )
+
+    li_metrics = run_metadata.get("linkedin_metrics", {})
+    if li_metrics:
+        print()
+        print("-" * 80)
+        print("LINKEDIN ACQUISITION METRICS")
+        print("-" * 80)
+        print(f"  Partitions submitted:   {li_metrics.get('partitions_submitted', 0)}")
+        print(f"  Partitions successful:  {li_metrics.get('partitions_successful', 0)}")
+        print(f"  Partitions failed:      {li_metrics.get('partitions_failed', 0)}")
+        print(f"  Total items returned:   {li_metrics.get('total_items_returned', 0)}")
+        print(f"  Total normalized jobs:  {li_metrics.get('total_normalized_jobs', 0)}")
+        print(f"  Total fresh jobs:       {li_metrics.get('total_fresh_jobs', 0)}")
+
     print()
     print("-" * 80)
     print("SOURCE COUNTS & BREAKDOWN")
@@ -2327,23 +2504,19 @@ def print_run_summary(run_metadata: dict, start_time: datetime, end_time: dateti
 
     print()
     print("-" * 80)
-    print("PER-SOURCE DIAGNOSTIC FUNNEL")
+    print("PER-SOURCE BREAKDOWN & ELIGIBILITY")
     print("-" * 80)
-    print(f"{'Source':<16} {'RAW':<6} {'NORM':<6} {'NEW':<6} {'COMP':<6} {'EXP':<6} {'LOC':<6} {'ROLE':<6} {'FINAL':<6}")
+    print(f"{'SOURCE':<18} | {'RAW':<6} | {'STALE':<6} | {'DUPLICATE':<10} | {'ELIGIBLE':<8}")
     print("-" * 80)
-    per_source = run_metadata.get("per_source_funnel", {})
-    for sid, counts in sorted(per_source.items()):
-        print(
-            f"{sid:<16} "
-            f"{counts.get('raw', 0):<6} "
-            f"{counts.get('normalized', 0):<6} "
-            f"{counts.get('new', 0):<6} "
-            f"{counts.get('company_pass', 0):<6} "
-            f"{counts.get('experience_pass', 0):<6} "
-            f"{counts.get('location_pass', 0):<6} "
-            f"{counts.get('role_pass', 0):<6} "
-            f"{counts.get('final_eligible', 0):<6}"
-        )
+    source_funnel = run_metadata.get("source_funnel", {})
+    all_sids = sorted(set(list(source_funnel.keys()) + list(source_stats.keys())))
+    for sid in all_sids:
+        sf = source_funnel.get(sid, {})
+        raw_s = sf.get("raw", source_stats.get(sid, {}).get("raw", 0))
+        stale_s = sf.get("stale", 0)
+        dup_s = sf.get("duplicate", 0)
+        elig_s = sf.get("eligible", 0)
+        print(f"{sid:<18} | {raw_s:<6} | {stale_s:<6} | {dup_s:<10} | {elig_s:<8}")
     print("-" * 80)
 
     # Diagnostic title logging

@@ -149,8 +149,8 @@ job_stale = {
     "title": "Stale ML Engineer",
     "postedAt": "2026-09-24T06:00:00Z",
 }
-stale_res = calculate_freshness(job_stale, discovered_at=ref_time)
-print("06:00 Job Freshness:", stale_res)
+stale_res = calculate_freshness(job_stale, discovered_at=ref_time, window_minutes=90)
+print("06:00 Job Freshness (with 90m cutoff):", stale_res)
 assert stale_res["is_fresh"] is False
 assert stale_res["discovery_latency_minutes"] == 240.0
 assert "Stale" in stale_res["freshness_reason"]

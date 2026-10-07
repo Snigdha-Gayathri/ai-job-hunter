@@ -27,6 +27,7 @@ from job_matcher import score_jobs_batch
 from main import (
     build_email_digest,
     calculate_freshness,
+    execute_apify_run,
     filter_jobs_by_company,
     filter_jobs_by_experience,
     filter_jobs_by_role,
@@ -489,6 +490,317 @@ class TestSchedulerAndState(unittest.TestCase):
                 save_state(test_state)
 
         self.assertIn("FAILED", test_state["last_run"].get("state_persistence", ""))
+
+    # -------------------------------------------------------------------------
+    # TEST 14: Apify live response handling - Direct dataset list (HTTP 200)
+    # -------------------------------------------------------------------------
+    def test_apify_linkedin_response_handling_direct_list(self):
+        """Verify execute_apify_run correctly extracts items when Apify returns direct list."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers = {
+            "X-Apify-Actor-Run-Id": "run_direct_001",
+            "X-Apify-Dataset-Id": "ds_direct_001",
+        }
+        mock_items = [
+            {"title": "AI Engineer", "companyName": "Anthropic Partner", "location": "Bengaluru"},
+            {"title": "ML Engineer", "companyName": "Google DeepMind Partner", "location": "Hyderabad"},
+        ]
+        mock_response.json.return_value = mock_items
+
+        run_meta = {"scraper_errors": []}
+        with patch("requests.post", return_value=mock_response):
+            jobs, meta = execute_apify_run(
+                payload={"startUrls": [{"url": "https://example.com"}]},
+                params={"token": "test_token_apify"},
+                label="UnitTest Direct",
+                run_metadata=run_meta,
+            )
+
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(meta["status_code"], 200)
+        self.assertEqual(meta["total_jobs"], 2)
+        self.assertEqual(meta["actor_run_id"], "run_direct_001")
+        self.assertEqual(meta["dataset_id"], "ds_direct_001")
+        self.assertEqual(meta["run_status"], "SUCCEEDED")
+        self.assertEqual(len(run_meta["scraper_errors"]), 0)
+
+    # -------------------------------------------------------------------------
+    # TEST 15: Apify empty LinkedIn response
+    # -------------------------------------------------------------------------
+    def test_apify_linkedin_empty_response(self):
+        """Verify execute_apify_run handles empty list cleanly without throwing."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.headers = {
+            "X-Apify-Actor-Run-Id": "run_empty_002",
+            "X-Apify-Dataset-Id": "ds_empty_002",
+        }
+        mock_response.json.return_value = []
+
+        run_meta = {"scraper_errors": []}
+        with patch("requests.post", return_value=mock_response):
+            jobs, meta = execute_apify_run(
+                payload={"startUrls": []},
+                params={"token": "test_token_apify"},
+                label="UnitTest Empty",
+                run_metadata=run_meta,
+            )
+
+        self.assertEqual(len(jobs), 0)
+        self.assertEqual(meta["total_jobs"], 0)
+        self.assertEqual(meta["status_code"], 200)
+
+    # -------------------------------------------------------------------------
+    # TEST 16: Apify error response (e.g. HTTP 500)
+    # -------------------------------------------------------------------------
+    def test_apify_linkedin_error_response(self):
+        """Verify execute_apify_run records scraper error on non-200/201 response."""
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.text = "Internal Server Error"
+        mock_response.headers = {}
+
+        run_meta = {"scraper_errors": []}
+        with patch("requests.post", return_value=mock_response):
+            jobs, meta = execute_apify_run(
+                payload={"startUrls": []},
+                params={"token": "test_token_apify"},
+                label="UnitTest Error",
+                run_metadata=run_meta,
+            )
+
+        self.assertEqual(len(jobs), 0)
+        self.assertEqual(meta["status"], 500)
+        self.assertEqual(len(run_meta["scraper_errors"]), 1)
+        self.assertIn("500", run_meta["scraper_errors"][0])
+
+    # -------------------------------------------------------------------------
+    # TEST 17: Apify async 201 Created -> Poll in-progress -> Fetch dataset
+    # -------------------------------------------------------------------------
+    def test_apify_linkedin_async_201_poll_and_fetch_dataset(self):
+        """
+        Verify that when Apify returns 201 Created with RUNNING run object,
+        execute_apify_run polls until SUCCEEDED and fetches dataset items from defaultDatasetId.
+        """
+        # POST response (HTTP 201 Created)
+        post_response = MagicMock()
+        post_response.status_code = 201
+        post_response.headers = {
+            "X-Apify-Actor-Run-Id": "run_async_777",
+            "X-Apify-Dataset-Id": "dataset_async_888",
+        }
+        post_response.json.return_value = {
+            "data": {
+                "id": "run_async_777",
+                "status": "RUNNING",
+                "defaultDatasetId": "dataset_async_888",
+            }
+        }
+
+        # Polling GET response (run status -> SUCCEEDED)
+        poll_response = MagicMock()
+        poll_response.status_code = 200
+        poll_response.json.return_value = {
+            "data": {
+                "id": "run_async_777",
+                "status": "SUCCEEDED",
+                "defaultDatasetId": "dataset_async_888",
+            }
+        }
+
+        # Dataset GET response (items from dataset)
+        dataset_response = MagicMock()
+        dataset_response.status_code = 200
+        dataset_response.json.return_value = [
+            {"title": "Junior AI Engineer", "companyName": "AI Innovation Lab", "location": "Pune"},
+            {"title": "LLM Developer", "companyName": "GenAI Systems", "location": "Mumbai"},
+        ]
+
+        def mock_get(url, *args, **kwargs):
+            if "actor-runs" in url:
+                return poll_response
+            elif "datasets" in url:
+                return dataset_response
+            raise ValueError(f"Unexpected URL: {url}")
+
+        run_meta = {"scraper_errors": []}
+        with patch("requests.post", return_value=post_response), \
+             patch("requests.get", side_effect=mock_get):
+            jobs, meta = execute_apify_run(
+                payload={"startUrls": [{"url": "https://example.com"}]},
+                params={"token": "test_token_apify"},
+                label="UnitTest Async Poll",
+                run_metadata=run_meta,
+            )
+
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(meta["actor_run_id"], "run_async_777")
+        self.assertEqual(meta["dataset_id"], "dataset_async_888")
+        self.assertEqual(meta["run_status"], "SUCCEEDED")
+        self.assertEqual(meta["total_jobs"], 2)
+
+    # -------------------------------------------------------------------------
+    # TEST 18: Freshness policy - 1 hour old job is eligible & fresh
+    # -------------------------------------------------------------------------
+    def test_freshness_policy_1h_eligible(self):
+        """Verify job posted 1 hour ago is eligible and marked fresh."""
+        now_utc = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+        job_1h = {
+            "source_job_id": "job_1h_001",
+            "title": "AI Engineer",
+            "companyName": "AI Corp",
+            "location": "Bengaluru",
+            "postedAt": (now_utc - timedelta(hours=1)).isoformat(),
+            "source": "linkedin",
+        }
+
+        fr = calculate_freshness(job_1h, now_utc)
+        self.assertTrue(fr["is_fresh"], "1-hour old job must be fresh under 24h window")
+        self.assertAlmostEqual(fr["discovery_latency_minutes"], 60.0, delta=1.0)
+
+        meta = {"jobs_within_freshness_window": 0, "stale_jobs_filtered": 0, "duplicates_skipped": 0, "email_retries": 0}
+        eligible = process_jobs_freshness_and_state([job_1h], {"jobs": {}}, now_utc, meta)
+        self.assertEqual(len(eligible), 1)
+        self.assertEqual(meta["jobs_within_freshness_window"], 1)
+
+    # -------------------------------------------------------------------------
+    # TEST 19: Freshness policy - 6 hours old job is eligible & fresh
+    # -------------------------------------------------------------------------
+    def test_freshness_policy_6h_eligible(self):
+        """Verify job posted 6 hours ago is eligible and marked fresh."""
+        now_utc = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+        job_6h = {
+            "source_job_id": "job_6h_001",
+            "title": "Generative AI Engineer",
+            "companyName": "GenAI Corp",
+            "location": "Hyderabad",
+            "postedAt": (now_utc - timedelta(hours=6)).isoformat(),
+            "source": "linkedin",
+        }
+
+        fr = calculate_freshness(job_6h, now_utc)
+        self.assertTrue(fr["is_fresh"], "6-hour old job must be fresh under 24h window")
+        self.assertAlmostEqual(fr["discovery_latency_minutes"], 360.0, delta=1.0)
+
+        meta = {"jobs_within_freshness_window": 0, "stale_jobs_filtered": 0, "duplicates_skipped": 0, "email_retries": 0}
+        eligible = process_jobs_freshness_and_state([job_6h], {"jobs": {}}, now_utc, meta)
+        self.assertEqual(len(eligible), 1)
+        self.assertEqual(meta["jobs_within_freshness_window"], 1)
+
+    # -------------------------------------------------------------------------
+    # TEST 20: Freshness policy - 24 hours old job is eligible & fresh
+    # -------------------------------------------------------------------------
+    def test_freshness_policy_24h_eligible(self):
+        """Verify job posted 23.5 hours ago is eligible and marked fresh."""
+        now_utc = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+        job_24h = {
+            "source_job_id": "job_24h_001",
+            "title": "LLM Engineer",
+            "companyName": "LLM Studio",
+            "location": "Remote",
+            "postedAt": (now_utc - timedelta(hours=23, minutes=30)).isoformat(),
+            "source": "ashby",
+        }
+
+        fr = calculate_freshness(job_24h, now_utc)
+        self.assertTrue(fr["is_fresh"], "Job within 24h must be fresh")
+
+        meta = {"jobs_within_freshness_window": 0, "stale_jobs_filtered": 0, "duplicates_skipped": 0, "email_retries": 0}
+        eligible = process_jobs_freshness_and_state([job_24h], {"jobs": {}}, now_utc, meta)
+        self.assertEqual(len(eligible), 1)
+
+    # -------------------------------------------------------------------------
+    # TEST 21: Freshness policy - Very old job (> 14 days) is filtered as stale
+    # -------------------------------------------------------------------------
+    def test_freshness_policy_ancient_stale(self):
+        """Verify job posted 20 days ago is filtered out as stale listing."""
+        now_utc = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
+        job_ancient = {
+            "source_job_id": "job_ancient_001",
+            "title": "Machine Learning Engineer",
+            "companyName": "Legacy Corp",
+            "location": "Bengaluru",
+            "postedAt": (now_utc - timedelta(days=20)).isoformat(),
+            "source": "greenhouse",
+        }
+
+        fr = calculate_freshness(job_ancient, now_utc)
+        self.assertFalse(fr["is_fresh"], "Ancient job must not be fresh")
+
+        meta = {"jobs_within_freshness_window": 0, "stale_jobs_filtered": 0, "duplicates_skipped": 0, "email_retries": 0}
+        eligible = process_jobs_freshness_and_state([job_ancient], {"jobs": {}}, now_utc, meta)
+        self.assertEqual(len(eligible), 0, "Ancient job must not be eligible")
+        self.assertEqual(meta["stale_jobs_filtered"], 1)
+
+    # -------------------------------------------------------------------------
+    # TEST 22: Merely discovered job is not permanently invisible
+    # -------------------------------------------------------------------------
+    def test_merely_discovered_job_remains_evaluable(self):
+        """
+        Verify that a job previously tracked with status='discovered'
+        does NOT get dropped at the deduplication gate and remains eligible for evaluation.
+        """
+        now_utc = datetime.now(timezone.utc)
+        state = {
+            "jobs": {
+                "disc_001": {
+                    "job_id": "disc_001",
+                    "status": "discovered",
+                    "title": "AI Platform Engineer",
+                    "company": "Deep Tech",
+                    "url": "https://example.com/jobs/disc_001",
+                }
+            }
+        }
+        job = {
+            "source_job_id": "disc_001",
+            "title": "AI Platform Engineer",
+            "companyName": "Deep Tech",
+            "location": "Bengaluru",
+            "url": "https://example.com/jobs/disc_001",
+            "postedAt": "2 hours ago",
+        }
+
+        meta = {"jobs_within_freshness_window": 0, "stale_jobs_filtered": 0, "duplicates_skipped": 0, "email_retries": 0}
+        eligible = process_jobs_freshness_and_state([job], state, now_utc, meta)
+        self.assertEqual(len(eligible), 1, "Discovered job must remain eligible for evaluation")
+        self.assertEqual(meta["duplicates_skipped"], 0)
+
+    # -------------------------------------------------------------------------
+    # TEST 23: Historical rejected status does not permanently suppress valid job
+    # -------------------------------------------------------------------------
+    def test_historical_rejected_job_reevaluated_through_filters(self):
+        """
+        Verify that a job historically marked 'rejected' in state is not unconditionally
+        dropped at dedup, allowing updated/current deterministic filters to re-evaluate it.
+        """
+        now_utc = datetime.now(timezone.utc)
+        state = {
+            "jobs": {
+                "rej_001": {
+                    "job_id": "rej_001",
+                    "status": "rejected",
+                    "reason": "old_filter_bug",
+                    "title": "AI Solutions Engineer",
+                    "company": "AI Partner",
+                    "url": "https://example.com/jobs/rej_001",
+                }
+            }
+        }
+        job = {
+            "source_job_id": "rej_001",
+            "title": "AI Solutions Engineer",
+            "companyName": "AI Partner",
+            "location": "Bengaluru",
+            "url": "https://example.com/jobs/rej_001",
+            "postedAt": "3 hours ago",
+        }
+
+        meta = {"jobs_within_freshness_window": 0, "stale_jobs_filtered": 0, "duplicates_skipped": 0, "email_retries": 0}
+        eligible = process_jobs_freshness_and_state([job], state, now_utc, meta)
+        self.assertEqual(len(eligible), 1, "Historically rejected job must be allowed through for re-evaluation")
+        self.assertEqual(meta["duplicates_skipped"], 0)
 
 
 if __name__ == "__main__":

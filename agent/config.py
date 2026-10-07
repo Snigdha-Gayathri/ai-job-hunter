@@ -325,13 +325,16 @@ HIGH_PRIORITY_SCORE = 80
 MEDIUM_PRIORITY_SCORE = 65
 HIGH_PRIORITY_MAX_AGE_MINUTES = 180  # 3 hours (immediate alert)
 
-# Operating freshness windows for reporting/ranking
-FRESHNESS_WINDOW_MINUTES = int(os.environ.get("FRESHNESS_WINDOW_MINUTES", "90"))
+# Operating freshness windows for reporting/ranking (sensible 24h window for hourly runs, 48h for ATS feeds)
+FRESHNESS_WINDOW_HOURS = int(os.environ.get("FRESHNESS_WINDOW_HOURS", "24"))
+FRESHNESS_WINDOW_MINUTES = int(
+    os.environ.get("FRESHNESS_WINDOW_MINUTES", str(FRESHNESS_WINDOW_HOURS * 60))
+)
 ATS_FRESHNESS_WINDOW_HOURS = int(os.environ.get("ATS_FRESHNESS_WINDOW_HOURS", "48"))
 ATS_FRESHNESS_WINDOW_MINUTES = int(
     os.environ.get("ATS_FRESHNESS_WINDOW_MINUTES", str(ATS_FRESHNESS_WINDOW_HOURS * 60))
 )
-FRESHNESS_WINDOW_HOURS = ATS_FRESHNESS_WINDOW_HOURS
+MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "14"))
 
 
 # ============================================================
