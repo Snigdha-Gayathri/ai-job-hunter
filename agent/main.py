@@ -42,6 +42,9 @@ from config import (
     HIGH_PRIORITY_MAX_AGE_MINUTES,
     TARGET_LOCATIONS as CONFIG_TARGET_LOCATIONS,
     TARGET_ROLE_FAMILIES,
+    APIFY_TOKEN,
+    get_clean_apify_token,
+    verify_apify_auth,
 )
 from filters import (
     is_company_excluded,
@@ -57,7 +60,7 @@ from filters import (
 # ============================================================
 
 # API Credentials & Settings
-APIFY_TOKEN = os.environ.get("APIFY_API_TOKEN", "")
+APIFY_TOKEN = get_clean_apify_token()
 BRIGHT_DATA_API_KEY = os.environ.get("BRIGHT_DATA_API_KEY", "")
 BRIGHT_DATA_DATASET_ID = os.environ.get(
     "BRIGHT_DATA_DATASET_ID",
@@ -820,6 +823,15 @@ def execute_apify_run(
     if "timeout" not in exec_params:
         exec_params["timeout"] = int(os.environ.get("APIFY_TIMEOUT_SECONDS", "120"))
 
+    # Safely extract and sanitize token for Bearer authorization without exposing it
+    token = get_clean_apify_token(exec_params.get("token") or APIFY_TOKEN)
+    req_headers = {
+        "Content-Type": "application/json",
+    }
+    if token:
+        req_headers["Authorization"] = f"Bearer {token}"
+        exec_params["token"] = token
+
     print()
     print(f"[{label}] Starting Apify invocation at {format_ist_and_utc(start_dt)}...")
     print(f"[{label}] Actor: {ACTOR_ID} | Endpoint: {APIFY_URL}")
@@ -828,6 +840,7 @@ def execute_apify_run(
     try:
         response = requests.post(
             APIFY_URL,
+            headers=req_headers,
             params=exec_params,
             json=payload,
             timeout=240,
@@ -862,6 +875,10 @@ def execute_apify_run(
         print(f"ERROR: {err_msg}")
         run_metadata["scraper_errors"].append(err_msg)
 
+        if response.status_code == 401:
+            print(f"[{label}] Apify authentication failed (HTTP 401: User or token not found). Check APIFY_API_TOKEN in GitHub Actions secrets.")
+            run_metadata["apify_auth_failed"] = True
+
         # Check for monthly usage hard limit exceeded
         if (
             response.status_code == 403
@@ -877,6 +894,7 @@ def execute_apify_run(
             "duration": duration,
             "actor_run_id": actor_run_id,
             "usage_limited": run_metadata.get("apify_usage_limited", False),
+            "auth_failed": run_metadata.get("apify_auth_failed", False),
         }
 
     try:
@@ -913,7 +931,7 @@ def execute_apify_run(
             dataset_id = run_obj.get("defaultDatasetId", "Not reported in header")
 
         # If run is still running or ready, poll until completion
-        token = exec_params.get("token", "")
+        token = get_clean_apify_token(exec_params.get("token") or APIFY_TOKEN)
         if run_status in ("RUNNING", "READY") and run_id and token:
             poll_url = f"https://api.apify.com/v2/actor-runs/{run_id}"
             max_wait = int(os.environ.get("APIFY_POLL_TIMEOUT_SECONDS", "60"))
@@ -924,7 +942,8 @@ def execute_apify_run(
                 time.sleep(poll_interval)
                 elapsed_poll += poll_interval
                 try:
-                    p_res = requests.get(poll_url, params={"token": token}, timeout=15)
+                    p_headers = {"Authorization": f"Bearer {token}"} if token else {}
+                    p_res = requests.get(poll_url, headers=p_headers, params={"token": token}, timeout=15)
                     if p_res.status_code == 200:
                         p_data = p_res.json().get("data", {})
                         run_status = p_data.get("status", run_status)
@@ -943,8 +962,10 @@ def execute_apify_run(
             dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
             print(f"[{label}] Fetching items from Apify dataset {dataset_id}...")
             try:
+                ds_headers = {"Authorization": f"Bearer {token}"} if token else {}
                 ds_res = requests.get(
                     dataset_url,
+                    headers=ds_headers,
                     params={"token": token, "clean": "true", "format": "json"},
                     timeout=60,
                 )
@@ -1118,13 +1139,14 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
     print("APIFY LIVE LINKEDIN SCRAPER - EMPIRICAL ACQUISITION VERIFICATION")
     print("=" * 80)
 
-    if not APIFY_TOKEN:
+    active_token = get_clean_apify_token() or APIFY_TOKEN
+    if not active_token:
         err = "APIFY_API_TOKEN is missing or not set in environment. LinkedIn acquisition could not be live-tested because APIFY_API_TOKEN is unavailable locally."
         print(f"ERROR: {err}")
         run_metadata["scraper_errors"].append(err)
         return []
 
-    params = {"token": APIFY_TOKEN}
+    params = {"token": active_token}
 
     # Targeted multi-partition production search configuration across required cities & AI role families
     payload = {
@@ -1206,10 +1228,12 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
     jobs_1, meta_1 = execute_apify_run(payload, params, "Run 1", run_metadata)
 
     # If startUrls returned 0 items, run fallback direct query to ensure resilience
-    # (Skip if Apify account monthly usage hard limit was reached to prevent redundant failed requests)
+    # (Skip if Apify account monthly usage hard limit was reached or auth failed to prevent redundant failed requests)
     if not jobs_1:
         if run_metadata.get("apify_usage_limited"):
             print("[APIFY FALLBACK] Skipped: Apify account monthly usage hard limit reached (HTTP 403).")
+        elif run_metadata.get("apify_auth_failed"):
+            print("[APIFY FALLBACK] Skipped: Apify authentication failed (HTTP 401: User or token not found).")
         else:
             print()
             print("[APIFY FALLBACK] startUrls yielded 0 jobs. Running direct search queries fallback...")
@@ -1264,7 +1288,7 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
     # PAUSE & LIVE RUN 2 (COMPARISON TEST)
     # --------------------------------------------------------
     enable_compare = os.environ.get("APIFY_COMPARE_RUNS", "false").lower() == "true"
-    if enable_compare and not run_metadata.get("apify_usage_limited"):
+    if enable_compare and not run_metadata.get("apify_usage_limited") and not run_metadata.get("apify_auth_failed"):
         sleep_seconds = int(os.environ.get("APIFY_COMPARE_DELAY_SECONDS", "120"))
         print()
         print("=" * 80)
@@ -1422,6 +1446,8 @@ def search_jobs(
                 return "linkedin", "LinkedIn (Apify)", [], "UNAVAILABLE", round(time.time() - t_li, 2), "APIFY_API_TOKEN not configured"
             if run_metadata.get("apify_usage_limited"):
                 status = "APIFY_USAGE_LIMITED"
+            elif run_metadata.get("apify_auth_failed"):
+                status = "APIFY_AUTH_FAILED"
             elif raw:
                 status = "OK"
             else:
@@ -2694,8 +2720,13 @@ if __name__ == "__main__":
         print("  --once             : Run exactly one complete job-hunting cycle and exit (default)")
         print("  --worker, --daemon : Run continuously as a lightweight background polling daemon")
         print("  --dry-run          : Run one acquisition pass without sending emails")
+        print("  --verify-apify     : Verify Apify authentication token and exit")
         print("  --help, -h         : Show this help message and exit")
         sys.exit(0)
+
+    if "--verify-apify" in sys.argv:
+        is_valid, status, _ = verify_apify_auth()
+        sys.exit(0 if is_valid else 1)
 
     if "--worker" in sys.argv or "--daemon" in sys.argv or os.environ.get("RUN_MODE") == "worker":
         run_worker_loop()

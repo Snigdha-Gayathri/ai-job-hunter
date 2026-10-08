@@ -61,7 +61,9 @@ jobs:
 
       - name: Run AI Recruiter Hunter
         env:
-          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+          APIFY_API_KEY: ${{ secrets.APIFY_API_KEY || secrets.APIFY_API_TOKEN || secrets.APIFY_TOKEN }}
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_KEY || secrets.APIFY_API_TOKEN || secrets.APIFY_TOKEN }}
+          APIFY_TOKEN: ${{ secrets.APIFY_API_KEY || secrets.APIFY_API_TOKEN || secrets.APIFY_TOKEN }}
 
           GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
 
