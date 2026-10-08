@@ -67,9 +67,16 @@ def search_recruiters():
         "Sending ONE recruiter discovery request to Apify..."
     )
 
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if APIFY_TOKEN:
+        headers["Authorization"] = f"Bearer {APIFY_TOKEN}"
+
     try:
         response = requests.post(
             RECRUITER_APIFY_URL,
+            headers=headers,
             params={
                 "token": APIFY_TOKEN,
             },

@@ -16,7 +16,12 @@ import config
 import filters
 import job_matcher
 import main
-from config import GROQ_BATCH_SIZE, MIN_MATCH_SCORE
+from config import (
+    GROQ_BATCH_SIZE,
+    MIN_MATCH_SCORE,
+    get_clean_apify_token,
+    verify_apify_auth,
+)
 from filters import (
     is_company_excluded,
     evaluate_experience_eligibility,
@@ -861,6 +866,133 @@ class TestSchedulerAndState(unittest.TestCase):
 
         # Also test with minimal/empty metadata
         print_run_summary({}, start_time, end_time)
+
+    # -------------------------------------------------------------------------
+    # TEST 26: Apify Token Sanitization & Fallback Resolution
+    # -------------------------------------------------------------------------
+    def test_apify_token_sanitization(self):
+        """Verify get_clean_apify_token properly strips whitespace, quotes, Bearer prefix, and resolves env vars."""
+        # Test direct cleaning
+        self.assertEqual(get_clean_apify_token("  token_123  \n"), "token_123")
+        self.assertEqual(get_clean_apify_token('"token_456"'), "token_456")
+        self.assertEqual(get_clean_apify_token("'token_789'"), "token_789")
+        self.assertEqual(get_clean_apify_token("Bearer my_token"), "my_token")
+        self.assertEqual(get_clean_apify_token("Bearer   token_space  "), "token_space")
+        self.assertEqual(get_clean_apify_token(""), "")
+        self.assertEqual(get_clean_apify_token(None), "")
+
+        # Test environment variable resolution (APIFY_API_KEY vs APIFY_API_TOKEN vs APIFY_TOKEN)
+        with patch.dict(os.environ, {"APIFY_API_KEY": "token_from_key", "APIFY_API_TOKEN": "token_from_api", "APIFY_TOKEN": "token_from_tok"}):
+            self.assertEqual(get_clean_apify_token(), "token_from_key")
+
+        with patch.dict(os.environ, {"APIFY_API_KEY": "", "APIFY_API_TOKEN": "token_from_api", "APIFY_TOKEN": "token_from_tok"}):
+            self.assertEqual(get_clean_apify_token(), "token_from_api")
+
+        with patch.dict(os.environ, {"APIFY_API_KEY": "", "APIFY_API_TOKEN": "", "APIFY_TOKEN": "token_from_tok"}):
+            self.assertEqual(get_clean_apify_token(), "token_from_tok")
+
+    # -------------------------------------------------------------------------
+    # TEST 27: Apify verify_apify_auth Diagnostic (HTTP 200, 401, 403)
+    # -------------------------------------------------------------------------
+    def test_verify_apify_auth_diagnostic(self):
+        """Verify verify_apify_auth against mock Apify /v2/users/me responses."""
+        # 1. Success (HTTP 200)
+        mock_200 = MagicMock()
+        mock_200.status_code = 200
+        mock_200.json.return_value = {"data": {"id": "usr_123", "username": "test_account"}}
+
+        with patch("requests.get", return_value=mock_200) as mock_get:
+            ok, status, details = verify_apify_auth("valid_token_abc")
+            self.assertTrue(ok)
+            self.assertEqual(status, "VALID")
+            self.assertEqual(details["username"], "test_account")
+            # Verify request headers used Authorization: Bearer
+            mock_get.assert_called_once()
+            call_kwargs = mock_get.call_args[1]
+            self.assertEqual(call_kwargs["headers"]["Authorization"], "Bearer valid_token_abc")
+
+        # 2. Authentication failure (HTTP 401: user-or-token-not-found)
+        mock_401 = MagicMock()
+        mock_401.status_code = 401
+        mock_401.json.return_value = {
+            "error": {"type": "user-or-token-not-found", "message": "User was not found or authentication token is not valid"}
+        }
+
+        with patch("requests.get", return_value=mock_401):
+            ok, status, details = verify_apify_auth("invalid_token_xyz")
+            self.assertFalse(ok)
+            self.assertEqual(status, "INVALID_TOKEN")
+            self.assertEqual(details["status_code"], 401)
+
+        # 3. Monthly usage limit (HTTP 403)
+        mock_403 = MagicMock()
+        mock_403.status_code = 403
+        mock_403.json.return_value = {
+            "error": {"type": "platform-feature-disabled", "message": "Monthly usage hard limit exceeded"}
+        }
+
+        with patch("requests.get", return_value=mock_403):
+            ok, status, details = verify_apify_auth("usage_limited_token")
+            self.assertTrue(ok)
+            self.assertEqual(status, "USAGE_LIMITED")
+            self.assertEqual(details["status_code"], 403)
+
+        # 4. Empty / missing token
+        ok, status, details = verify_apify_auth("")
+        self.assertFalse(ok)
+        self.assertEqual(status, "MISSING_TOKEN")
+
+    # -------------------------------------------------------------------------
+    # TEST 28: execute_apify_run Sends Authorization: Bearer Header
+    # -------------------------------------------------------------------------
+    def test_execute_apify_run_sends_authorization_header(self):
+        """Verify execute_apify_run sends standard HTTP Authorization: Bearer header."""
+        mock_res = MagicMock()
+        mock_res.status_code = 200
+        mock_res.headers = {"X-Apify-Actor-Run-Id": "run_auth_1", "X-Apify-Dataset-Id": "ds_auth_1"}
+        mock_res.json.return_value = []
+
+        run_meta = {"scraper_errors": []}
+        with patch("requests.post", return_value=mock_res) as mock_post:
+            execute_apify_run(
+                payload={"startUrls": []},
+                params={"token": "  my_secret_token  "},
+                label="UnitTest Header Check",
+                run_metadata=run_meta,
+            )
+
+            mock_post.assert_called_once()
+            call_headers = mock_post.call_args[1]["headers"]
+            self.assertIn("Authorization", call_headers)
+            self.assertEqual(call_headers["Authorization"], "Bearer my_secret_token")
+            # Verify token in params was also cleaned
+            self.assertEqual(mock_post.call_args[1]["params"]["token"], "my_secret_token")
+
+    # -------------------------------------------------------------------------
+    # TEST 29: execute_apify_run HTTP 401 Marks Auth Failed
+    # -------------------------------------------------------------------------
+    def test_execute_apify_run_401_marks_auth_failed(self):
+        """Verify execute_apify_run correctly marks apify_auth_failed on HTTP 401."""
+        mock_401 = MagicMock()
+        mock_401.status_code = 401
+        mock_401.text = '{"error": {"type": "user-or-token-not-found", "message": "User was not found"}}'
+        mock_401.headers = {}
+
+        run_meta = {"scraper_errors": []}
+        with patch("requests.post", return_value=mock_401):
+            jobs, meta = execute_apify_run(
+                payload={"startUrls": []},
+                params={"token": "bad_token"},
+                label="UnitTest 401",
+                run_metadata=run_meta,
+            )
+
+            self.assertEqual(jobs, [])
+            self.assertEqual(meta["status"], 401)
+            self.assertTrue(meta["auth_failed"])
+            self.assertTrue(run_meta["apify_auth_failed"])
+            self.assertEqual(len(run_meta["scraper_errors"]), 1)
+            self.assertIn("401", run_meta["scraper_errors"][0])
 
 
 if __name__ == "__main__":
