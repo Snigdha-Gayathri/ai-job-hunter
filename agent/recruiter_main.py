@@ -1,9 +1,13 @@
+import sys
+
 from config import (
     MAX_EMAILS_PER_RUN,
     MAX_RECRUITERS_TO_CONTACT,
     MIN_EMAIL_SCORE,
     OUTREACH_STATE_FILE,
     RECRUITER_STATE_FILE,
+    ProfileConfigurationError,
+    get_active_profile,
 )
 
 from outreach import (
@@ -24,6 +28,12 @@ from recruiter_state import (
 
 
 def main():
+    try:
+        profile = get_active_profile()
+    except ProfileConfigurationError as cfg_err:
+        print(f"CONFIGURATION ERROR: {cfg_err}")
+        sys.exit(1)
+
     print("=" * 70)
     print("AI RECRUITER HUNTER STARTED")
     print("=" * 70)
@@ -73,7 +83,7 @@ def main():
     # DISCOVERY
     # ========================================================
 
-    recruiters = search_recruiters()
+    recruiters = search_recruiters(profile=profile)
 
     if not recruiters:
         print()
@@ -95,7 +105,8 @@ def main():
     print("=" * 70)
 
     ranked = filter_and_rank_recruiters(
-        recruiters
+        recruiters,
+        profile=profile,
     )
 
     print(
@@ -109,7 +120,6 @@ def main():
 
     eligible = []
 
-    previously_seen = 0
     already_contacted = 0
     no_email = 0
 
@@ -249,7 +259,8 @@ def main():
         try:
             subject, status = (
                 send_outreach_email(
-                    recruiter
+                    recruiter,
+                    profile=profile,
                 )
             )
 

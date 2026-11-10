@@ -38,7 +38,27 @@ from config import (
     SOURCES_CONFIG,
     ATS_TARGET_COMPANIES,
     APIFY_TOKEN,
+    ProfileConfigurationError,
+    get_active_profile,
+    get_profile_roles,
 )
+
+
+def _ats_role_keywords() -> list[str]:
+    """Return generic tech title markers plus active profile role tokens for ATS pre-selection."""
+    base = [
+        "ai", "machine learning", "ml", "genai", "llm", "engineer", "developer",
+        "data", "research", "intern", "applied", "software", "scientist",
+    ]
+    try:
+        profile = get_active_profile()
+        extra = [r.strip().lower() for r in get_profile_roles(profile) if r.strip()]
+        for tok in extra:
+            if tok not in base:
+                base.append(tok)
+    except ProfileConfigurationError:
+        pass
+    return base
 
 logger = logging.getLogger("ai_job_hunter.sources")
 
@@ -818,13 +838,11 @@ class GreenhouseSource(BaseSource):
                     jobs = data.get("jobs", []) if isinstance(data, dict) else []
                     jobs.sort(key=lambda j: str(j.get("updated_at") or j.get("first_published") or ""), reverse=True)
                     
-                    # Prioritize AI/ML, tech, data, and engineer roles across all boards
+                    # Prioritize roles matching active profile and general tech roles across boards
+                    ats_keywords = _ats_role_keywords()
                     tech_jobs = [
                         j for j in jobs
-                        if any(k in str(j.get("title", "")).lower() for k in [
-                            "ai", "machine learning", "ml", "genai", "llm", "engineer", "developer", 
-                            "data", "research", "intern", "applied", "software", "scientist"
-                        ])
+                        if any(k in str(j.get("title", "")).lower() for k in ats_keywords)
                     ]
                     selected = tech_jobs if tech_jobs else jobs
                     for j in selected:
@@ -895,12 +913,10 @@ class LeverSource(BaseSource):
                     data = resp.json()
                     if isinstance(data, list):
                         data.sort(key=lambda j: str(j.get("createdAt") or ""), reverse=True)
+                        ats_keywords = _ats_role_keywords()
                         tech_jobs = [
                             j for j in data
-                            if any(k in str(j.get("text", "")).lower() for k in [
-                                "ai", "machine learning", "ml", "genai", "llm", "engineer", "developer", 
-                                "data", "research", "intern", "applied", "software", "scientist"
-                            ])
+                            if any(k in str(j.get("text", "")).lower() for k in ats_keywords)
                         ]
                         selected = tech_jobs if tech_jobs else data
                         for j in selected:
@@ -973,12 +989,10 @@ class AshbySource(BaseSource):
                     data = resp.json()
                     jobs = data.get("jobs", []) if isinstance(data, dict) else []
                     jobs.sort(key=lambda j: str(j.get("publishedAt") or ""), reverse=True)
+                    ats_keywords = _ats_role_keywords()
                     tech_jobs = [
                         j for j in jobs
-                        if any(k in str(j.get("title", "")).lower() for k in [
-                            "ai", "machine learning", "ml", "genai", "llm", "engineer", "developer", 
-                            "data", "research", "intern", "applied", "software", "scientist"
-                        ])
+                        if any(k in str(j.get("title", "")).lower() for k in ats_keywords)
                     ]
                     selected = tech_jobs if tech_jobs else jobs
                     for j in selected:

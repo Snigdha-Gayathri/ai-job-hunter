@@ -1,6 +1,58 @@
 import json
 from datetime import datetime, timezone, timedelta
 
+from config import set_active_profile
+
+TEST_AI_PROFILE = {
+    "name": "Test AI Candidate",
+    "headline": "AI/ML Engineer | LLMs | RAG",
+    "education": {
+        "degree": "B.S.",
+        "field": "Computer Science",
+        "graduation_year": "2025",
+        "cgpa": "8.5",
+    },
+    "skills": {
+        "core": [
+            "Python", "Machine Learning", "Deep Learning", "PyTorch",
+            "TensorFlow", "scikit-learn", "LLMs", "Generative AI",
+            "RAG", "Agentic AI", "LangChain", "LangGraph", "FastAPI",
+            "Vector Databases", "Qdrant", "Pinecone", "Docker",
+            "AI Agents", "MLOps", "Quantization", "vLLM",
+        ],
+    },
+    "projects": ["Sample RAG Engine", "Sample Inference Benchmark"],
+    "experience_preferences": {
+        "level": "entry_level",
+        "years_of_experience": 0,
+        "max_required_yoe": 2,
+        "accept_fresher": True,
+        "exclude_senior_titles": True,
+    },
+    "target_roles": [
+        "AI Engineer", "Junior AI Engineer", "Machine Learning Engineer",
+        "ML Engineer", "Generative AI Engineer", "LLM Engineer",
+        "Agentic AI Engineer", "Applied AI Engineer", "AI/ML Engineer",
+        "AI Developer", "AI Intern", "Machine Learning Intern",
+    ],
+    "target_role_families": [
+        "AI Software Engineer", "AI Platform Engineer", "AI Solutions Engineer",
+        "NLP Engineer", "Computer Vision Engineer", "LLM Application Engineer",
+        "Applied Scientist",
+    ],
+    "target_locations": ["Mumbai", "Hyderabad", "Bangalore", "Bengaluru", "Pune", "Remote"],
+    "remote_preferences": {
+        "accept_remote": True,
+        "accept_hybrid_in_target_cities": True,
+        "home_country": "India",
+        "allowed_remote_regions": ["India", "Worldwide", "Anywhere", "Global"],
+    },
+    "excluded_companies": ["restrictedcorp", "restrictedsub"],
+    "resume_path": "",
+    "video_resume_url": "",
+}
+set_active_profile(TEST_AI_PROFILE)
+
 from job_matcher import (
     local_score_job,
     locally_filter_jobs,
@@ -928,7 +980,7 @@ mock_email_jobs = [
         "_latency_formatted": "2 hours ago",
         "apply_url": "https://jobs.ashbyhq.com/perplexity/112233",
         "key_matches": ["Python", "PyTorch", "Quantization", "vLLM", "Docker"],
-        "match_reason": "Matches the candidate's hands-on project work in model optimization, quantization benchmarks, and latency profiling.",
+        "match_reason": "Matches the candidate's hands-on project work in model latency optimization, quantization benchmarks, and profiling.",
     },
     {
         "_job_id": "rok_556677",
@@ -956,7 +1008,7 @@ assert subject_multi == "AI Job Hunter | 4 New Matches | Mumbai · Hyderabad · 
 # Single job subject test
 subject_single, html_single, text_single = build_email_digest([mock_email_jobs[1]])  # Orvera AI in Pune
 print(f"Generated Single-job Subject: '{subject_single}'")
-assert subject_single == "AI Job Hunter | 1 New AI Match | Pune"
+assert subject_single == "AI Job Hunter | 1 New Match | Pune"
 
 # 15. Email contains only target-location jobs
 for j in mock_email_jobs:
@@ -1232,25 +1284,23 @@ print("Audit: All non-genuine remote phrases ('occasional remote', 'remote-frien
 
 print()
 print("=" * 70)
-print("TEST 19: COMPANY EXCLUSION FILTER (RESTRICTEDCORP AND SUBSIDIARIES)")
+print("TEST 19: COMPANY EXCLUSION FILTER (CONFIGURED EXCLUSIONS & VARIANTS)")
 print("=" * 70)
 
-restrictedcorp_variants = [
+excluded_variants = [
     "RestrictedCorp",
     "RestrictedCorp Limited",
     "RestrictedCorp Ltd",
     "RestrictedCorp BPM",
     "RestrictedCorp BPM Limited",
     "RestrictedCorp Technologies",
-    "RestrictedCorp Technologies Ltd",
     "RestrictedCorp Public Services",
     "RestrictedSub Systems",
     "RestrictedSub",
-    "RestrictedCorp Compaz",
-    "RestrictedCorp McCamish Systems",
+    "RestrictedCorp Consulting",
 ]
 
-for variant in restrictedcorp_variants:
+for variant in excluded_variants:
     is_exc, reason = is_company_excluded(variant)
     assert is_exc is True, f"Expected {variant} to be excluded, but got {is_exc}"
     print(f"  [VERIFIED EXCLUDED] '{variant}' -> {reason}")
@@ -1274,8 +1324,8 @@ for valid in valid_companies:
     print(f"  [VERIFIED ALLOWED] '{valid}' -> Allowed")
 
 dummy_jobs_company = [
-    {"_job_id": f"inf_{i}", "title": "AI Engineer", "companyName": comp}
-    for i, comp in enumerate(restrictedcorp_variants)
+    {"_job_id": f"exc_{i}", "title": "AI Engineer", "companyName": comp}
+    for i, comp in enumerate(excluded_variants)
 ] + [
     {"_job_id": f"valid_{i}", "title": "AI Engineer", "companyName": comp}
     for i, comp in enumerate(valid_companies)
@@ -1283,7 +1333,7 @@ dummy_jobs_company = [
 
 filtered_comp = filter_jobs_by_company(dummy_jobs_company)
 assert len(filtered_comp) == len(valid_companies), f"Expected {len(valid_companies)}, got {len(filtered_comp)}"
-print(f"Company filter verified: {len(dummy_jobs_company)} input -> {len(filtered_comp)} accepted (ALL RestrictedCorp excluded BEFORE Groq!)")
+print(f"Company filter verified: {len(dummy_jobs_company)} input -> {len(filtered_comp)} accepted (ALL configured exclusions filtered BEFORE Groq!)")
 
 
 print()
@@ -1490,10 +1540,10 @@ print("=" * 70)
 synthetic_dataset = []
 job_counter = 0
 
-# 1. 10 RestrictedCorp jobs
+# 1. 10 Excluded company jobs
 for i in range(10):
     job_counter += 1
-    comp = restrictedcorp_variants[i % len(restrictedcorp_variants)]
+    comp = excluded_variants[i % len(excluded_variants)]
     synthetic_dataset.append({
         "_job_id": f"syn_{job_counter:03d}",
         "title": "AI Engineer - LLM & RAG",
@@ -1609,7 +1659,7 @@ assert len(f_eligible) == 120, f"All 120 new jobs should be eligible for filteri
 
 # Step 2: Company Filter
 f_comp_passed = filter_jobs_by_company(f_eligible, state=funnel_state, run_metadata=funnel_meta)
-assert len(f_comp_passed) == 110, f"Expected 110 jobs to pass company filter (10 RestrictedCorp rejected), got {len(f_comp_passed)}"
+assert len(f_comp_passed) == 110, f"Expected 110 jobs to pass company filter (10 excluded rejected), got {len(f_comp_passed)}"
 assert funnel_meta["company_rejected_jobs"] == 10
 
 # Step 3: Experience Filter
@@ -2063,7 +2113,7 @@ for target_count in test_counts:
     assert apply_card_count == target_count, f"Expected {target_count} apply cards in email, got {apply_card_count}"
 
     if target_count == 1:
-        assert "1 New AI Match" in subject
+        assert "1 New Match" in subject
     else:
         assert f"{target_count} New Matches" in subject
 

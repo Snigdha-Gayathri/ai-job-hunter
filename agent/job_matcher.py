@@ -12,12 +12,31 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "openai/gpt-oss-20b"
 
-# Import batch size and match settings from config
+# Import batch size, match settings, and profile helpers from config
 try:
-    from config import GROQ_BATCH_SIZE, MIN_MATCH_SCORE
+    from config import (
+        GROQ_BATCH_SIZE,
+        MIN_MATCH_SCORE,
+        get_active_profile,
+        get_profile_experience_prefs,
+        get_profile_locations,
+        get_profile_projects,
+        get_profile_remote_prefs,
+        get_profile_roles,
+        get_profile_skills,
+        profile_targets_ai_roles,
+    )
 except ImportError:
     GROQ_BATCH_SIZE = 15
     MIN_MATCH_SCORE = 50
+    get_active_profile = None
+    get_profile_experience_prefs = None
+    get_profile_locations = None
+    get_profile_projects = None
+    get_profile_remote_prefs = None
+    get_profile_roles = None
+    get_profile_skills = None
+    profile_targets_ai_roles = None
 
 try:
     from filters import (
@@ -25,16 +44,22 @@ try:
         AI_ROLE_PATTERNS,
         AI_TITLE_KEYWORDS,
         AI_TOKEN_IN_TITLE_RE,
+        _compile_role_pattern,
+        _expand_allowed_regions,
         is_role_relevant,
+        is_valid_work_location,
     )
 except ImportError:
     AI_ROLE_COMPILED = []
     AI_ROLE_PATTERNS = []
     AI_TITLE_KEYWORDS = []
     AI_TOKEN_IN_TITLE_RE = None
+    _compile_role_pattern = None
+    _expand_allowed_regions = None
     is_role_relevant = None
+    is_valid_work_location = None
 
-# Local filtering keywords.
+# Generic AI role keywords (used only when the active profile targets AI/ML roles).
 AI_ROLE_KEYWORDS = {
     "ai engineer",
     "artificial intelligence engineer",
@@ -97,6 +122,7 @@ AI_ROLE_KEYWORDS = {
     "ai code trainer",
 }
 
+
 def sanitize_untrusted_text(text: str) -> str:
     """
     Sanitize untrusted job description text to prevent prompt injection attacks.
@@ -119,32 +145,6 @@ def sanitize_untrusted_text(text: str) -> str:
             cleaned = re.sub(re.escape(phrase), "[REDACTED_INJECTION_ATTEMPT]", cleaned, flags=re.IGNORECASE)
     return cleaned
 
-
-TECHNICAL_KEYWORDS = {
-    "python",
-    "pytorch",
-    "tensorflow",
-    "keras",
-    "scikit-learn",
-    "hugging face",
-    "transformers",
-    "llm",
-    "rag",
-    "langchain",
-    "langgraph",
-    "vector database",
-    "vector search",
-    "embeddings",
-    "qdrant",
-    "pinecone",
-    "neo4j",
-    "fastapi",
-    "docker",
-    "machine learning",
-    "deep learning",
-    "generative ai",
-    "artificial intelligence",
-}
 
 SENIOR_TERMS = {
     "senior",
@@ -182,86 +182,140 @@ FRESHER_TERMS = {
 }
 
 
-CANDIDATE_PROFILE = """
-Candidate: Candidate Name
+def _format_entries(items: list) -> list[str]:
+    """Format list of string or dict profile entries into clean bullet lines."""
+    lines: list[str] = []
+    for item in items or []:
+        if isinstance(item, str) and item.strip():
+            lines.append(f"- {item.strip()}")
+        elif isinstance(item, dict):
+            name = str(item.get("name") or item.get("title") or item.get("role") or "").strip()
+            org = str(item.get("company") or item.get("organization") or "").strip()
+            duration = str(item.get("duration") or "").strip()
+            desc = str(item.get("description") or item.get("summary") or "").strip()
+            techs = item.get("technologies") or item.get("skills") or []
 
-Education:
-- Bachelor's in Computer Science
-- Graduation year: 202X
-- CGPA: N/A
+            header_parts = [p for p in (name, f"at {org}" if org else "", f"({duration})" if duration else "") if p]
+            header = " ".join(header_parts)
+            if desc:
+                header = f"{header}: {desc}" if header else desc
+            if isinstance(techs, list) and techs:
+                tech_str = ", ".join(str(t).strip() for t in techs if str(t).strip())
+                if tech_str:
+                    header = f"{header} [{tech_str}]" if header else tech_str
+            if header:
+                lines.append(f"- {header}")
+    return lines
 
-Target roles:
-- AI Engineer
-- Junior AI Engineer
-- Machine Learning Engineer
-- ML Engineer
-- Generative AI Engineer
-- LLM Engineer
-- Agentic AI Engineer
-- Applied AI Engineer
-- AI/ML Engineer
-- Entry-level AI/ML roles
 
-Programming:
-- Python
-- Java
-- C++
+def build_candidate_profile_text(profile: dict | None = None) -> str:
+    """
+    Dynamically construct the LLM candidate profile context from the active user profile.
+    """
+    active_profile = get_active_profile(profile)
+    sections: list[str] = []
 
-Machine Learning / Deep Learning:
-- PyTorch
-- TensorFlow
-- Keras
-- scikit-learn
-- NumPy
-- Pandas
-- Hugging Face Transformers
+    name = str(active_profile.get("name") or "").strip()
+    headline = str(active_profile.get("headline") or "").strip()
+    summary = str(active_profile.get("summary") or "").strip()
 
-Generative AI:
-- LLMs
-- RAG
-- Agentic AI
-- LangChain
-- LangGraph
-- multi-agent systems
-- tool calling
-- structured outputs
-- prompt engineering
-- embeddings
-- hybrid retrieval
-- vector search
-- reranking
+    header_lines = [f"Candidate: {name}"]
+    if headline:
+        header_lines.append(f"Headline: {headline}")
+    if summary:
+        header_lines.append(f"Summary: {summary}")
+    sections.append("\n".join(header_lines))
 
-Databases:
-- Qdrant
-- Pinecone
-- Supabase
-- Neo4j
+    # Education
+    edu = active_profile.get("education")
+    if isinstance(edu, dict):
+        edu_lines: list[str] = []
+        degree = str(edu.get("degree") or "").strip()
+        field = str(edu.get("field") or "").strip()
+        institution = str(edu.get("institution") or "").strip()
+        grad_year = str(edu.get("graduation_year") or "").strip()
+        cgpa = str(edu.get("cgpa") or "").strip()
 
-Backend / Engineering:
-- FastAPI
-- React
-- Next.js
-- TypeScript
-- Docker
+        if degree and field:
+            edu_lines.append(f"- {degree} in {field}")
+        elif degree or field:
+            edu_lines.append(f"- {degree or field}")
+        if institution:
+            edu_lines.append(f"- Institution: {institution}")
+        if grad_year:
+            edu_lines.append(f"- Graduation year: {grad_year}")
+        if cgpa:
+            edu_lines.append(f"- CGPA: {cgpa}")
+        if edu_lines:
+            sections.append("Education:\n" + "\n".join(edu_lines))
 
-Relevant projects:
-- Sample Project Alpha
-- Sample Project Beta
-- Sample Project Gamma
-- Sample Project Delta
-- Sample Project Epsilon
+    # Experience level
+    exp_prefs = get_profile_experience_prefs(active_profile)
+    exp_meta_lines: list[str] = []
+    if exp_prefs.get("level"):
+        exp_meta_lines.append(f"- Experience level: {exp_prefs['level']}")
+    if exp_prefs.get("years_of_experience") is not None:
+        exp_meta_lines.append(f"- Years of experience: {exp_prefs['years_of_experience']}")
+    if exp_meta_lines:
+        sections.append("Experience Profile:\n" + "\n".join(exp_meta_lines))
 
-Additional technical experience:
-- model optimization
-- model quantization
-- FP32 / FP16 / BF16
-- 4-bit / 8-bit quantization
-- transformer architectures
-- GPU performance profiling
-- benchmarking
-- AI evaluation
-- MLOps concepts
-"""
+    # Target roles
+    target_roles = active_profile.get("target_roles") or get_profile_roles(active_profile)
+    if target_roles:
+        role_lines = "\n".join(f"- {str(r).strip()}" for r in target_roles if str(r).strip())
+        if role_lines:
+            sections.append(f"Target roles:\n{role_lines}")
+
+    # Skills
+    raw_skills = active_profile.get("skills")
+    if isinstance(raw_skills, dict):
+        categories = raw_skills.get("categories")
+        core = raw_skills.get("core")
+        skill_blocks: list[str] = []
+        if isinstance(categories, dict):
+            for cat_name, cat_vals in categories.items():
+                if isinstance(cat_vals, list):
+                    cleaned = [str(v).strip() for v in cat_vals if str(v).strip()]
+                    if cleaned:
+                        label = str(cat_name).replace("_", " ").title()
+                        skill_blocks.append(f"{label}:\n" + "\n".join(f"- {v}" for v in cleaned))
+        if not skill_blocks and isinstance(core, list):
+            cleaned_core = [str(v).strip() for v in core if str(v).strip()]
+            if cleaned_core:
+                skill_blocks.append("Technical Skills:\n" + "\n".join(f"- {v}" for v in cleaned_core))
+        if skill_blocks:
+            sections.append("\n\n".join(skill_blocks))
+    else:
+        flat_skills = get_profile_skills(active_profile)
+        if flat_skills:
+            sections.append("Technical Skills:\n" + "\n".join(f"- {s}" for s in flat_skills))
+
+    # Work experience & internships
+    work_lines = _format_entries(active_profile.get("work_experience") or [])
+    if work_lines:
+        sections.append("Work Experience:\n" + "\n".join(work_lines))
+
+    intern_lines = _format_entries(active_profile.get("internships") or [])
+    if intern_lines:
+        sections.append("Internships:\n" + "\n".join(intern_lines))
+
+    # Projects & achievements
+    proj_lines = _format_entries(get_profile_projects(active_profile))
+    if proj_lines:
+        sections.append("Relevant projects:\n" + "\n".join(proj_lines))
+
+    ach_lines = _format_entries(active_profile.get("achievements") or [])
+    if ach_lines:
+        sections.append("Achievements:\n" + "\n".join(ach_lines))
+
+    # Preferred locations
+    locs = get_profile_locations(active_profile)
+    remote_prefs = get_profile_remote_prefs(active_profile)
+    loc_summary = ", ".join(locs) if locs else ("Remote" if remote_prefs.get("accept_remote") else "")
+    if loc_summary:
+        sections.append(f"Preferred locations: {loc_summary}")
+
+    return "\n\n".join(sections)
 
 
 def extract_json(text: str) -> Any:
@@ -304,7 +358,6 @@ def extract_json(text: str) -> Any:
         pass
 
     # 4. Outermost JSON array: [ ... ]
-    # We check array FIRST because batch job matching expects a list of evaluations
     arr_start = raw.find("[")
     arr_end = raw.rfind("]")
     if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
@@ -371,9 +424,8 @@ def get_job_text(job: dict) -> str:
     """
     Build one normalized text representation of a job.
     """
-
     title = str(job.get("title") or "")
-    company = str(job.get("companyName") or "")
+    company = str(job.get("companyName") or job.get("company") or "")
     location = str(job.get("location") or "")
 
     description = (
@@ -390,112 +442,112 @@ def get_job_text(job: dict) -> str:
     ).lower()
 
 
-def local_score_job(job: dict) -> dict:
+def _token_in_text(token: str, text_lower: str) -> bool:
+    """Boundary-safe token check so short skills like 'java' or 'c' do not false-match."""
+    t = token.strip().lower()
+    if not t:
+        return False
+    return bool(re.search(rf"(?<!\w){re.escape(t)}(?!\w)", text_lower))
+
+
+def local_score_job(job: dict, profile: dict | None = None) -> dict:
     """
-    Deterministic scoring engine (used for pre-filtering and when Groq is unavailable).
-    Scores candidates based on title match, technical overlap, fresher alignment,
-    location, and penalties for senior roles or foreign on-site.
+    Deterministic scoring engine driven by the active user profile
+    (used for pre-filtering and when Groq is unavailable).
     """
+    active_profile = get_active_profile(profile)
+    roles = get_profile_roles(active_profile)
+    skills = get_profile_skills(active_profile)
+    exp_prefs = get_profile_experience_prefs(active_profile)
+    targets_ai = profile_targets_ai_roles(active_profile)
+
     title = str(job.get("title") or "").lower()
     text = get_job_text(job)
 
     score = 0
     reasons = []
 
-    # 1. Strong signal: title is directly related to AI/ML.
-    title_matches = [
-        keyword
-        for keyword in AI_ROLE_KEYWORDS
-        if keyword in title
-    ]
-    has_compiled_title_match = False
-    if AI_ROLE_COMPILED:
-        has_compiled_title_match = any(pattern.search(title) for pattern in AI_ROLE_COMPILED)
+    # 1. Role title match against active profile's target roles
+    title_role_matched = any(
+        _compile_role_pattern(r).search(title)
+        for r in roles
+    ) if _compile_role_pattern else any(r.lower() in title for r in roles)
 
-    if title_matches or has_compiled_title_match:
+    if not title_role_matched and targets_ai:
+        title_role_matched = (
+            any(kw in title for kw in AI_ROLE_KEYWORDS)
+            or (bool(AI_ROLE_COMPILED) and any(p.search(title) for p in AI_ROLE_COMPILED))
+        )
+
+    if title_role_matched:
         score += 45
-        reasons.append("AI/ML role detected in title")
-    elif is_role_relevant and is_role_relevant(title, text)[0]:
-        # Title is broader (e.g. Software Engineer, MTS), but description strongly focuses on AI/ML
+        reasons.append("Target role detected in title")
+    elif is_role_relevant and is_role_relevant(title, text, profile=active_profile)[0]:
         score += 35
-        reasons.append("AI/ML specialization confirmed by description")
+        reasons.append("Profile role specialization confirmed by description")
 
-    # 2. Technical overlap (up to 35 points)
+    # 2. Technical skill overlap against active profile skills (up to 35 points)
     technical_matches = [
-        keyword
-        for keyword in TECHNICAL_KEYWORDS
-        if keyword in text
+        skill
+        for skill in skills
+        if _token_in_text(skill, text)
     ]
 
-    technical_points = min(len(technical_matches) * 5, 35)
+    # Scale points so profiles with smaller focused skill lists still reach strong scores
+    pts_per_skill = 10 if len(skills) <= 5 else 5
+    technical_points = min(len(technical_matches) * pts_per_skill, 35)
 
     if technical_points:
         score += technical_points
-        reasons.append(
-            f"{len(technical_matches)} relevant technical signals"
-        )
+        reasons.append(f"{len(technical_matches)} relevant technical signals")
 
-    # 3. Fresher-friendly language (+15 points)
-    fresher_matches = [
-        keyword
-        for keyword in FRESHER_TERMS
-        if keyword in text
-    ]
+    # 3. Experience alignment based on profile's experience preferences
+    max_yoe = exp_prefs.get("max_required_yoe")
+    accept_fresher = exp_prefs.get("accept_fresher", True)
+    exclude_senior = exp_prefs.get("exclude_senior_titles", True)
 
-    if fresher_matches:
-        score += 15
-        reasons.append("Entry-level/fresher language detected")
+    if accept_fresher and (max_yoe is None or max_yoe <= 2):
+        fresher_matches = [kw for kw in FRESHER_TERMS if kw in text]
+        if fresher_matches:
+            score += 15
+            reasons.append("Entry-level/fresher language detected")
+    else:
+        score += 10
+        reasons.append("Experience level aligned")
 
-    # 4. Seniority penalty (-70 points)
-    senior_matches = [
-        keyword
-        for keyword in SENIOR_TERMS
-        if keyword in title
-    ]
+    if exclude_senior:
+        senior_matches = [kw for kw in SENIOR_TERMS if kw in title]
+        if senior_matches:
+            score -= 70
+            reasons.append("Senior-level title detected")
 
-    if senior_matches:
-        score -= 70
-        reasons.append("Senior-level title detected")
+    if max_yoe is not None:
+        reject_min = max(max_yoe + 3, 5) if max_yoe <= 2 else (max_yoe + 1)
+        exp_matches = re.findall(r"\b(\d+)\s*(?:\+|-\s*\d+)?\s*(?:years?|yrs?|yoe)\b", text)
+        if any(int(m) >= reject_min for m in exp_matches):
+            score -= 25
+            reasons.append("High experience requirement detected")
 
-    # 5. Explicit high experience requirement (-25 points)
-    experience_patterns = [
-        r"\b([5-9]|[1-9][0-9])\+?\s*years?\b",
-        r"\b([5-9]|[1-9][0-9])\s*-\s*([5-9]|[1-9][0-9])\s*years?\b",
-    ]
+    # 4. Location and remote eligibility driven by active profile
+    loc_ok = False
+    if is_valid_work_location:
+        loc_ok, _ = is_valid_work_location(job, profile=active_profile)
 
-    high_experience = any(
-        re.search(pattern, text)
-        for pattern in experience_patterns
-    )
-
-    if high_experience:
-        score -= 25
-        reasons.append("High experience requirement detected")
-
-    # 6. Location and remote eligibility
-    location_str = str(job.get("location") or "").lower()
-    remote_type = str(job.get("remote_type") or "").lower()
-    is_remote = (
-        "remote" in location_str
-        or "worldwide" in location_str
-        or "anywhere" in location_str
-        or remote_type == "remote"
-    )
-    is_target_city = any(
-        loc in location_str
-        for loc in ("hyderabad", "bengaluru", "bangalore", "mumbai", "pune")
-    )
-    is_foreign_onsite = any(
-        c in location_str
-        for c in ("united states", "usa", "uk", "london", "germany", "singapore", "canada", "australia")
-    ) and not is_remote and not is_target_city
-
-    if is_target_city or is_remote:
+    if loc_ok:
         score += 10
         reasons.append("Target location or remote eligible")
-    elif is_foreign_onsite:
-        score -= 40
-        reasons.append("Non-India onsite location detected")
+    else:
+        remote_prefs = get_profile_remote_prefs(active_profile)
+        allowed_regions = _expand_allowed_regions(remote_prefs) if _expand_allowed_regions else set()
+        location_str = str(job.get("location") or "").lower()
+        foreign_countries = ("united states", "usa", "uk", "london", "germany", "singapore", "canada", "australia")
+        is_foreign_onsite = any(
+            c in location_str and c not in allowed_regions
+            for c in foreign_countries
+        ) and "remote" not in location_str
+        if is_foreign_onsite:
+            score -= 40
+            reasons.append("Non-target foreign onsite location detected")
 
     score = max(0, min(score, 100))
 
@@ -506,29 +558,35 @@ def local_score_job(job: dict) -> dict:
     }
 
 
-def classify_priority(job: dict) -> str:
+def classify_priority(job: dict, profile: dict | None = None) -> str:
     """
-    Classify a job into HIGH, MEDIUM, or LOW priority.
-
-    HIGH Priority Jobs:
-    - Match score >= 80 (or local score >= 80 if fallback)
-    - Fresh: recently discovered / posted within the last 3 hours
-    - Fresher/0-1 year compatible (no senior penalty)
-    - Location compatible (India or Remote)
-
-    HIGH priority jobs trigger immediate notification alerts.
+    Classify a job into HIGH, MEDIUM, or LOW priority based on score,
+    experience compatibility, and active profile location eligibility.
     """
+    active_profile = get_active_profile(profile)
+    exp_prefs = get_profile_experience_prefs(active_profile)
+
     score = job.get("match_score", job.get("local_score", 0))
     title = str(job.get("title") or "").lower()
-    location = str(job.get("location") or "").lower()
-    remote_type = str(job.get("remote_type") or "").lower()
     exp_fit = str(job.get("experience_fit") or "").upper()
 
-    # Disqualifiers for HIGH priority
-    is_senior = exp_fit == "POOR" or any(term in title for term in SENIOR_TERMS)
-    is_foreign_onsite = any(
-        c in location for c in ("united states", "usa", "uk", "london", "germany", "singapore", "canada", "australia")
-    ) and ("remote" not in location and remote_type != "remote" and "india" not in location)
+    is_senior = exp_fit == "POOR" or (
+        exp_prefs.get("exclude_senior_titles", True)
+        and any(term in title for term in SENIOR_TERMS)
+    )
+
+    is_foreign_onsite = False
+    location = str(job.get("location") or "").lower()
+    remote_type = str(job.get("remote_type") or "").lower()
+    if location and is_valid_work_location:
+        loc_ok, _ = is_valid_work_location(job, profile=active_profile)
+        if not loc_ok:
+            remote_prefs = get_profile_remote_prefs(active_profile)
+            allowed_regions = _expand_allowed_regions(remote_prefs) if _expand_allowed_regions else set()
+            is_foreign_onsite = any(
+                c in location and c not in allowed_regions
+                for c in ("united states", "usa", "uk", "london", "germany", "singapore", "canada", "australia")
+            ) and ("remote" not in location and remote_type != "remote")
 
     if score >= 80 and not is_senior and not is_foreign_onsite:
         return "HIGH"
@@ -540,17 +598,17 @@ def classify_priority(job: dict) -> str:
 def locally_filter_jobs(
     jobs: list[dict],
     minimum_score: int = 20,
+    profile: dict | None = None,
 ) -> list[dict]:
     """
-    Apply local scoring and return only plausible AI/ML jobs.
-
+    Apply local scoring against the active profile and return plausible candidates.
     No external API calls are made here.
     """
-
+    active_profile = get_active_profile(profile)
     candidates = []
 
     for job in jobs:
-        result = local_score_job(job)
+        result = local_score_job(job, profile=active_profile)
 
         job["local_score"] = result["local_score"]
         job["local_reasons"] = result["local_reasons"]
@@ -565,22 +623,26 @@ def locally_filter_jobs(
 
     print(
         f"Local filter: {len(jobs)} jobs -> "
-        f"{len(candidates)} AI/ML candidates (retaining ALL candidates without truncation)"
+        f"{len(candidates)} profile-aligned candidates (retaining ALL candidates without truncation)"
     )
 
     return candidates
 
 
-def build_batch_prompt(jobs: list[dict]) -> str:
+def build_batch_prompt(jobs: list[dict], profile: dict | None = None) -> str:
     """
-    Construct one prompt containing multiple jobs.
-
-    This replaces one prompt per job.
+    Construct one prompt containing multiple jobs and the active user profile.
     Applies prompt-injection sanitization to untrusted external descriptions.
     """
+    active_profile = get_active_profile(profile)
+    candidate_profile_text = build_candidate_profile_text(active_profile)
+    skills = get_profile_skills(active_profile)
+    target_roles = active_profile.get("target_roles") or get_profile_roles(active_profile)
+    exp_prefs = get_profile_experience_prefs(active_profile)
+    edu = active_profile.get("education") if isinstance(active_profile.get("education"), dict) else {}
+    grad_year = str(edu.get("graduation_year") or "").strip()
 
     job_blocks = []
-
     for index, job in enumerate(jobs, start=1):
         title = job.get("title") or "Unknown title"
         company = job.get("companyName") or job.get("company") or "Unknown company"
@@ -607,25 +669,18 @@ Description:
 """
         )
 
+    roles_preview = ", ".join(str(r) for r in target_roles[:8]) or "the candidate's target roles"
+    top_skills_bullets = "\n".join(f"   - {s}" for s in skills[:20]) or "   - Candidate's listed technical skills"
 
-    return f"""
-You are an expert technical recruiter.
+    max_yoe = exp_prefs.get("max_required_yoe")
+    yoe_val = exp_prefs.get("years_of_experience")
+    accept_fresher = exp_prefs.get("accept_fresher", True)
+    exclude_senior = exp_prefs.get("exclude_senior_titles", True)
 
-Evaluate ALL jobs below against the candidate profile.
-
-Do not evaluate them independently with separate responses.
-Return one JSON array containing exactly one result for each job.
-
-# CANDIDATE PROFILE
-
-{CANDIDATE_PROFILE}
-
-# EVALUATION RULES
-
-1. The candidate is a recent graduate targeting entry-level and
-   junior AI/ML engineering roles.
-
-2. Penalize roles that explicitly require significant prior
+    if accept_fresher and (max_yoe is None or max_yoe <= 2):
+        grad_note = f"a {grad_year} graduate " if grad_year else ""
+        rule_1 = f"1. The candidate is {grad_note}targeting entry-level and junior roles ({roles_preview})."
+        rule_2_4 = """2. Penalize roles that explicitly require significant prior
    professional experience.
 
 3. Strongly penalize:
@@ -637,7 +692,47 @@ Return one JSON array containing exactly one result for each job.
    - Director
    - Architect
 
-4. Treat "0-2 years" and "0-1 years" as compatible.
+4. Treat "0-2 years" and "0-1 years" as compatible."""
+        rule_10 = """10. A role should score highly when the candidate could
+    reasonably perform the work given their projects, internships, and skills."""
+        rule_16 = """16. If the job explicitly requires more experience than an
+    entry-level candidate can reasonably satisfy, reflect that heavily."""
+    else:
+        exp_desc = f"{yoe_val} years of experience" if yoe_val is not None else "their stated experience"
+        max_desc = f"up to {max_yoe} years required" if max_yoe is not None else "matching experience requirements"
+        rule_1 = f"1. The candidate has {exp_desc} and is targeting: {roles_preview}."
+        senior_rule = (
+            "3. Penalize Senior/Lead/Staff/Principal/Architect titles that exceed the candidate's target level."
+            if exclude_senior
+            else "3. Evaluate seniority alignment fairly against the candidate's work experience and target roles."
+        )
+        rule_2_4 = f"""2. Penalize roles whose required years of experience significantly exceed the candidate's background ({max_desc}).
+
+{senior_rule}
+
+4. Treat roles within the candidate's experience range ({max_desc}) as compatible."""
+        rule_10 = """10. A role should score highly when the candidate's experience,
+    projects, and technical skills align well with the core responsibilities."""
+        rule_16 = """16. If the job explicitly requires significantly more experience than the
+    candidate holds, reflect that in experience_fit and match_score."""
+
+    return f"""
+You are an expert technical recruiter.
+
+Evaluate ALL jobs below against the candidate profile.
+
+Do not evaluate them independently with separate responses.
+Return one JSON array containing exactly one result for each job.
+
+# CANDIDATE PROFILE
+
+{candidate_profile_text}
+
+# EVALUATION RULES
+
+{rule_1}
+
+{rule_2_4}
 
 5. Do NOT reject a role simply because the candidate does not
    have every preferred technology.
@@ -645,34 +740,16 @@ Return one JSON array containing exactly one result for each job.
 6. Prioritize actual technical overlap over keyword overlap.
 
 7. Strong positive signals include:
-   - Python
-   - Machine Learning
-   - Deep Learning
-   - PyTorch
-   - TensorFlow
-   - Hugging Face
-   - LLMs
-   - RAG
-   - AI agents
-   - LangChain
-   - LangGraph
-   - vector databases
-   - embeddings
-   - FastAPI
-   - inference
-   - MLOps
-   - AI evaluation
-   - Docker
+{top_skills_bullets}
 
-8. Projects count as legitimate evidence of technical ability.
+8. Projects and practical experience count as legitimate evidence of technical ability.
 
 9. Distinguish between required qualifications,
    preferred qualifications, and responsibilities.
 
-10. A role should score highly when the candidate could
-    reasonably perform the work despite being a fresher.
+{rule_10}
 
-11. A job requiring unrelated enterprise software skills
+11. A job requiring unrelated enterprise or non-target skills
     should score lower.
 
 12. Do not fabricate candidate experience.
@@ -680,15 +757,13 @@ Return one JSON array containing exactly one result for each job.
 13. Be conservative and honest.
 
 14. Do not give a high score merely because the job contains
-    many AI keywords.
+    many buzzwords.
 
-15. If the role is primarily software engineering, data
-    engineering, QA, support, business analysis, or another
-    non-AI discipline with only minor AI exposure, reduce
-    the score.
+15. If the role is primarily an unrelated discipline outside the
+    candidate's target roles ({roles_preview}) with only minor overlap,
+    reduce the score.
 
-16. If the job explicitly requires more experience than a
-    fresh graduate can reasonably satisfy, reflect that heavily.
+{rule_16}
 
 17. Evaluate actual responsibilities, not just title.
 
@@ -759,18 +834,20 @@ IMPORTANT:
 """
 
 
-def score_single_batch(jobs: list[dict]) -> list[dict]:
+def score_single_batch(jobs: list[dict], profile: dict | None = None) -> list[dict]:
     """
     Score a single batch of up to GROQ_BATCH_SIZE jobs with one Groq API request.
     """
     if not jobs:
         return []
 
+    active_profile = get_active_profile(profile)
+
     if not GROQ_API_KEY:
         print("GROQ_API_KEY is not configured.")
-        return local_fallback_results(jobs)
+        return local_fallback_results(jobs, profile=active_profile)
 
-    prompt = build_batch_prompt(jobs)
+    prompt = build_batch_prompt(jobs, profile=active_profile)
 
     print(
         f"Sending Groq batch request for {len(jobs)} jobs..."
@@ -822,7 +899,7 @@ def score_single_batch(jobs: list[dict]) -> list[dict]:
             if retry_after:
                 print(f"Provider requested retry after {retry_after} seconds.")
             print("Using local fallback for this batch.")
-            return local_fallback_results(jobs)
+            return local_fallback_results(jobs, profile=active_profile)
 
         response.raise_for_status()
         data = response.json()
@@ -836,7 +913,7 @@ def score_single_batch(jobs: list[dict]) -> list[dict]:
                 f"Content preview: {content[:300]}"
             )
 
-        return merge_ai_results(jobs, results)
+        return merge_ai_results(jobs, results, profile=active_profile)
 
     except Exception as error:
         print(f"Groq batch matching failed: {error}. Falling back to local scoring.")
@@ -844,24 +921,25 @@ def score_single_batch(jobs: list[dict]) -> list[dict]:
             jobs,
             fallback_reason=f"Groq batch matching failed ({error}); local scoring used.",
             groq_status=f"FAILED: {error}",
+            profile=active_profile,
         )
 
 
-def score_jobs_batch(jobs: list[dict], batch_size: int = GROQ_BATCH_SIZE) -> list[dict]:
+def score_jobs_batch(
+    jobs: list[dict],
+    batch_size: int = GROQ_BATCH_SIZE,
+    profile: dict | None = None,
+) -> list[dict]:
     """
     Score multiple jobs across ALL batches without any candidate truncation.
-    If 37 candidates are present:
-      Batch 1 = 15
-      Batch 2 = 15
-      Batch 3 = 7
-    All 37 candidates are evaluated and returned.
     """
     if not jobs:
         return []
 
-    # If small enough, process as single batch
+    active_profile = get_active_profile(profile)
+
     if len(jobs) <= batch_size:
-        return score_single_batch(jobs)
+        return score_single_batch(jobs, profile=active_profile)
 
     all_scored = []
     num_batches = (len(jobs) + batch_size - 1) // batch_size
@@ -870,10 +948,10 @@ def score_jobs_batch(jobs: list[dict], batch_size: int = GROQ_BATCH_SIZE) -> lis
     for b_idx in range(num_batches):
         batch = jobs[b_idx * batch_size : (b_idx + 1) * batch_size]
         print(f"  [Groq Batch {b_idx + 1}/{num_batches}] Evaluating {len(batch)} candidates...")
-        scored_batch = score_single_batch(batch)
+        scored_batch = score_single_batch(batch, profile=active_profile)
         all_scored.extend(scored_batch)
         if b_idx < num_batches - 1:
-            time.sleep(1.0)  # gentle pacing between batches to respect rate limits
+            time.sleep(1.0)
 
     print(f"All {len(all_scored)} candidates processed across {num_batches} batches.")
     return all_scored
@@ -882,12 +960,13 @@ def score_jobs_batch(jobs: list[dict], batch_size: int = GROQ_BATCH_SIZE) -> lis
 def merge_ai_results(
     jobs: list[dict],
     results: list[dict],
+    profile: dict | None = None,
 ) -> list[dict]:
     """
     Attach AI results to the original job objects.
     Preserves all input jobs.
     """
-
+    active_profile = get_active_profile(profile)
     result_by_index = {}
 
     for result in results:
@@ -908,7 +987,7 @@ def merge_ai_results(
                 f"Using local score fallback."
             )
             if "local_score" not in job:
-                res = local_score_job(job)
+                res = local_score_job(job, profile=active_profile)
                 job["local_score"] = res["local_score"]
                 job["local_reasons"] = res["local_reasons"]
                 job["technical_matches"] = res.get("technical_matches", [])
@@ -990,18 +1069,18 @@ def local_fallback_results(
     jobs: list[dict],
     fallback_reason: str = "AI batch matcher unavailable; local scoring used.",
     groq_status: str = "FALLBACK",
+    profile: dict | None = None,
 ) -> list[dict]:
     """
     Produce usable results without Groq.
-
     This guarantees that an AI API issue does not result in 0 jobs found.
     """
-
+    active_profile = get_active_profile(profile)
     results = []
 
     for job in jobs:
         if "local_score" not in job:
-            res = local_score_job(job)
+            res = local_score_job(job, profile=active_profile)
             job["local_score"] = res["local_score"]
             job["local_reasons"] = res["local_reasons"]
             job["technical_matches"] = res.get("technical_matches", [])
@@ -1012,8 +1091,6 @@ def local_fallback_results(
             qualification = "STRONG_MATCH"
         elif score >= 75:
             qualification = "GOOD_MATCH"
-        elif score >= 60:
-            qualification = "MODERATE_MATCH"
         elif score >= 50:
             qualification = "MODERATE_MATCH"
         else:
@@ -1029,23 +1106,14 @@ def local_fallback_results(
             )
             else "MODERATE"
         )
-        job["technical_fit"] = min(
-            100,
-            score,
-        )
-        job["role_fit"] = min(
-            100,
-            score,
-        )
-        job["key_matches"] = job.get(
-            "technical_matches",
-            [],
-        )
+        job["technical_fit"] = min(100, score)
+        job["role_fit"] = min(100, score)
+        job["key_matches"] = job.get("technical_matches", [])
         job["missing_requirements"] = []
         job["concerns"] = [fallback_reason]
         job["match_reason"] = (
             f"Deterministic match: score {score}/100. "
-            f"{', '.join(job.get('local_reasons', [])) or 'Passed AI/ML relevance filter.'}"
+            f"{', '.join(job.get('local_reasons', [])) or 'Passed profile relevance filter.'}"
         )
         job["matcher_path"] = "LOCAL"
         job["groq_status"] = groq_status
@@ -1056,29 +1124,22 @@ def local_fallback_results(
 
 
 def safe_int(value: Any) -> int:
-    """
-    Safely convert model output to an integer.
-    """
-
+    """Safely convert model output to an integer."""
     try:
         return max(0, min(100, int(value)))
     except (TypeError, ValueError):
         return 0
 
 
-def score_job(job: dict) -> dict:
+def score_job(job: dict, profile: dict | None = None) -> dict:
     """
     Backward-compatible single-job matcher.
-
-    IMPORTANT:
-    This function exists for the old test file.
-
     Production execution should use score_jobs_batch().
     """
-
-    results = score_jobs_batch([job])
+    active_profile = get_active_profile(profile)
+    results = score_jobs_batch([job], profile=active_profile)
 
     if not results:
-        return local_fallback_results([job])[0]
+        return local_fallback_results([job], profile=active_profile)[0]
 
     return results[0]

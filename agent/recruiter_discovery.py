@@ -6,10 +6,48 @@ from config import (
     RECRUITER_APIFY_URL,
     RECRUITER_JOB_TITLES,
     RECRUITER_LOCATIONS,
+    get_active_profile,
+    get_profile_locations,
+    get_profile_remote_prefs,
+    get_profile_roles,
+    profile_targets_ai_roles,
 )
 
 
-def search_recruiters():
+def _build_recruiter_search_query(profile: dict) -> str:
+    """Build recruiter search query dynamically from the active profile."""
+    if profile_targets_ai_roles(profile):
+        return (
+            '"AI recruiter" OR '
+            '"technical recruiter" OR '
+            '"talent acquisition" OR '
+            '"technical talent acquisition" OR '
+            '"AI hiring" OR '
+            '"machine learning recruiter" OR '
+            '"technology recruiter"'
+        )
+    roles = (profile.get("target_roles") or get_profile_roles(profile))[:3]
+    role_clauses = " OR ".join(f'"{r} hiring"' for r in roles if r)
+    base = '"technical recruiter" OR "talent acquisition" OR "technical talent acquisition" OR "technology recruiter"'
+    return f"{base} OR {role_clauses}" if role_clauses else base
+
+
+def _build_recruiter_locations(profile: dict) -> list[str]:
+    """Derive recruiter search locations from the active profile."""
+    remote_prefs = get_profile_remote_prefs(profile)
+    locs: list[str] = []
+    home = str(remote_prefs.get("home_country") or "").strip()
+    if home:
+        locs.append(home)
+    for loc in get_profile_locations(profile):
+        if loc not in locs:
+            locs.append(loc)
+    if remote_prefs.get("accept_remote") and "Remote" not in locs:
+        locs.append("Remote")
+    return locs or RECRUITER_LOCATIONS
+
+
+def search_recruiters(profile: dict | None = None):
     """
     Perform exactly ONE Apify request.
 
@@ -23,27 +61,20 @@ def search_recruiters():
     We deliberately do not make a second request
     for individual email enrichment.
     """
+    active_profile = get_active_profile(profile)
 
     payload = {
         "profileScraperMode": (
             "Full + email search"
         ),
 
-        "searchQuery": (
-            '"AI recruiter" OR '
-            '"technical recruiter" OR '
-            '"talent acquisition" OR '
-            '"technical talent acquisition" OR '
-            '"AI hiring" OR '
-            '"machine learning recruiter" OR '
-            '"technology recruiter"'
-        ),
+        "searchQuery": _build_recruiter_search_query(active_profile),
 
         "maxItems": (
             MAX_RECRUITERS_DISCOVERED
         ),
 
-        "locations": RECRUITER_LOCATIONS,
+        "locations": _build_recruiter_locations(active_profile),
 
         "currentJobTitles": (
             RECRUITER_JOB_TITLES

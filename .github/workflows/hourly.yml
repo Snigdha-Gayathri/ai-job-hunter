@@ -42,12 +42,16 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          PROFILE_JSON: ${{ secrets.PROFILE_JSON }}
         run: |
           missing=()
           [ -z "$APIFY_TOKEN_RESOLVED" ] && missing+=("APIFY_API_KEY (or APIFY_API_TOKEN)")
           [ -z "$GROQ_API_KEY" ] && missing+=("GROQ_API_KEY")
           [ -z "$GMAIL_USERNAME" ] && missing+=("GMAIL_USERNAME")
           [ -z "$GMAIL_APP_PASSWORD" ] && missing+=("GMAIL_APP_PASSWORD")
+          if [ -z "$PROFILE_JSON" ] && [ ! -f "config/profile.private.json" ]; then
+            missing+=("PROFILE_JSON")
+          fi
           if [ ${#missing[@]} -ne 0 ]; then
             echo "::error::Missing required GitHub Actions secret(s): ${missing[*]}"
             echo "Configure these secrets in GitHub Repo Settings -> Secrets and variables -> Actions."
@@ -86,6 +90,7 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          PROFILE_JSON: ${{ secrets.PROFILE_JSON }}
         run: |
           cd agent
           python main.py --once

@@ -34,6 +34,22 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Validate required secrets
+        env:
+          APIFY_TOKEN_RESOLVED: ${{ secrets.APIFY_API_KEY || secrets.APIFY_API_TOKEN || secrets.APIFY_TOKEN }}
+          PROFILE_JSON: ${{ secrets.PROFILE_JSON }}
+        run: |
+          missing=()
+          [ -z "$APIFY_TOKEN_RESOLVED" ] && missing+=("APIFY_API_KEY (or APIFY_API_TOKEN)")
+          if [ -z "$PROFILE_JSON" ] && [ ! -f "config/profile.private.json" ]; then
+            missing+=("PROFILE_JSON")
+          fi
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Missing required GitHub Actions secret(s): ${missing[*]}"
+            echo "Configure these secrets in GitHub Repo Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
       # ------------------------------------------------------
       # RESTORE PERSISTENT STATE
       # ------------------------------------------------------
@@ -70,6 +86,8 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
 
           VIDEO_RESUME_URL: ${{ secrets.VIDEO_RESUME_URL }}
+
+          PROFILE_JSON: ${{ secrets.PROFILE_JSON }}
 
           AUTO_SEND: "false"
 

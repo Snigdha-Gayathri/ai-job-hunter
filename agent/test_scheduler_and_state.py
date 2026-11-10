@@ -16,10 +16,18 @@ import config
 import filters
 import job_matcher
 import main
+import outreach
+import recruiter_matcher
 from config import (
     GROQ_BATCH_SIZE,
     MIN_MATCH_SCORE,
+    PROFILE_EXAMPLE_PATH,
+    ProfileConfigurationError,
+    get_active_profile,
     get_clean_apify_token,
+    load_profile,
+    set_active_profile,
+    validate_profile,
     verify_apify_auth,
 )
 from filters import (
@@ -28,7 +36,12 @@ from filters import (
     is_valid_work_location,
     is_role_relevant,
 )
-from job_matcher import score_jobs_batch
+from job_matcher import (
+    build_batch_prompt,
+    build_candidate_profile_text,
+    local_score_job,
+    score_jobs_batch,
+)
 from main import (
     build_email_digest,
     calculate_freshness,
@@ -48,6 +61,51 @@ from main import (
 )
 
 
+TEST_AI_PROFILE = {
+    "name": "Test AI Candidate",
+    "headline": "AI/ML Engineer | LLMs | RAG",
+    "education": {
+        "degree": "B.S.",
+        "field": "Computer Science",
+        "graduation_year": "2025",
+        "cgpa": "8.6",
+    },
+    "skills": {
+        "core": [
+            "Python", "Machine Learning", "Deep Learning", "PyTorch",
+            "TensorFlow", "LLMs", "Generative AI", "RAG", "LangChain",
+            "LangGraph", "FastAPI", "Docker", "Vector Databases",
+        ],
+    },
+    "projects": ["Sample RAG Pipeline", "Sample Model Benchmark"],
+    "experience_preferences": {
+        "level": "entry_level",
+        "years_of_experience": 0,
+        "max_required_yoe": 2,
+        "accept_fresher": True,
+        "exclude_senior_titles": True,
+    },
+    "target_roles": [
+        "AI Engineer", "Machine Learning Engineer", "Generative AI Engineer",
+        "LLM Engineer", "Applied AI Engineer",
+    ],
+    "target_role_families": [
+        "AI Developer", "AI Intern", "LLM Application Engineer",
+        "Agentic AI Engineer", "Computer Vision Engineer", "NLP Engineer",
+    ],
+    "target_locations": ["Mumbai", "Hyderabad", "Bangalore", "Bengaluru", "Pune", "Remote"],
+    "remote_preferences": {
+        "accept_remote": True,
+        "accept_hybrid_in_target_cities": True,
+        "home_country": "India",
+        "allowed_remote_regions": ["India", "Worldwide", "Anywhere", "Global"],
+    },
+    "excluded_companies": ["restrictedcorp", "restrictedsub"],
+    "resume_path": "",
+    "video_resume_url": "",
+}
+
+
 class TestSchedulerAndState(unittest.TestCase):
     """
     Test suite verifying:
@@ -59,7 +117,7 @@ class TestSchedulerAndState(unittest.TestCase):
     6. Email-failed jobs remain eligible for retry.
     7. 3, 20, 30, 47, 80 qualifying jobs produce exact matching counts of email cards.
     8. Multiple Groq batches process every single candidate without truncation.
-    9. RestrictedCorp remains strictly excluded.
+    9. Configured company exclusions are strictly enforced.
     10. Senior roles remain excluded.
     11. Target locations remain strictly enforced.
     12. Role family matches remain comprehensive.
@@ -77,8 +135,10 @@ class TestSchedulerAndState(unittest.TestCase):
         main.STATE_DIR = self.state_dir
         main.STATE_FILE = self.state_dir / "seen_jobs.json"
         main.METRICS_FILE = self.state_dir / "last_run_metrics.json"
+        set_active_profile(TEST_AI_PROFILE)
 
     def tearDown(self):
+        set_active_profile(None)
         main.STATE_DIR = self.orig_state_dir
         main.STATE_FILE = self.orig_state_file
         main.METRICS_FILE = self.orig_metrics_file
@@ -347,7 +407,7 @@ class TestSchedulerAndState(unittest.TestCase):
                 f"Expected {count} email cards, got {apply_count}"
             )
             if count == 1:
-                self.assertIn("1 New AI Match", subject)
+                self.assertIn("1 New Match", subject)
             else:
                 self.assertIn(f"{count} New Matches", subject)
 
@@ -375,10 +435,10 @@ class TestSchedulerAndState(unittest.TestCase):
             )
 
     # -------------------------------------------------------------------------
-    # TEST 9: RestrictedCorp remains strictly excluded
+    # TEST 9: Configured company exclusions remain strictly enforced
     # -------------------------------------------------------------------------
-    def test_restrictedcorp_variants_remain_excluded(self):
-        """Verify RestrictedCorp, RestrictedCorp Limited, RestrictedCorp BPM, RestrictedSub are rejected."""
+    def test_configured_company_exclusions_enforced(self):
+        """Verify profile-configured company exclusions and subsidiaries are rejected."""
         variants = [
             "RestrictedCorp",
             "RestrictedCorp Limited",
@@ -392,7 +452,7 @@ class TestSchedulerAndState(unittest.TestCase):
             is_exc, reason = is_company_excluded(comp)
             self.assertTrue(is_exc, f"Company {comp} was not excluded!")
 
-        # Legitimate AI companies must NOT be excluded
+        # Legitimate companies must NOT be excluded
         legit = ["Google", "Microsoft", "Nvidia", "TCS", "Wipro", "OpenAI"]
         for comp in legit:
             is_exc, _ = is_company_excluded(comp)
@@ -993,6 +1053,405 @@ class TestSchedulerAndState(unittest.TestCase):
             self.assertTrue(run_meta["apify_auth_failed"])
             self.assertEqual(len(run_meta["scraper_errors"]), 1)
             self.assertIn("401", run_meta["scraper_errors"][0])
+
+
+class TestMultiUserProfiles(unittest.TestCase):
+    """
+    Focused regression and multi-profile isolation tests:
+    - Independent profile loading & validation
+    - Dynamic LLM prompt construction
+    - Profile-specific role, location, experience, and company filtering
+    - Profile-specific resume attachment and recruiter outreach
+    - Actionable configuration errors when profile is missing or invalid
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.temp_dir.name)
+        set_active_profile(None)
+
+        self.ai_profile = {
+            "name": "Jordan Patel",
+            "headline": "Applied AI Engineer | Python | LangChain | RAG",
+            "education": {
+                "degree": "B.Tech",
+                "field": "Artificial Intelligence",
+                "graduation_year": "2026",
+                "cgpa": "8.8",
+            },
+            "skills": {
+                "core": ["Python", "LangChain", "RAG", "LangGraph", "PyTorch", "FastAPI"],
+            },
+            "projects": ["Vector Search Assistant"],
+            "experience_preferences": {
+                "level": "entry_level",
+                "years_of_experience": 0,
+                "max_required_yoe": 2,
+                "accept_fresher": True,
+                "exclude_senior_titles": True,
+            },
+            "target_roles": ["AI Engineer", "Applied AI Engineer"],
+            "target_role_families": ["AI Engineer", "Applied AI Engineer", "LLM Engineer"],
+            "target_locations": ["Hyderabad", "Bengaluru", "Mumbai", "Remote"],
+            "remote_preferences": {
+                "accept_remote": True,
+                "accept_hybrid_in_target_cities": True,
+                "home_country": "India",
+                "allowed_remote_regions": ["India", "Worldwide"],
+            },
+            "excluded_companies": ["excludedalpha", "alphabpm"],
+            "resume_path": "",
+            "video_resume_url": "",
+        }
+
+        self.java_resume = self.tmp_path / "alex_java_resume.pdf"
+        self.java_resume.write_bytes(b"%PDF-1.4\n%Alex Rivera Java Resume\n")
+
+        self.java_profile = {
+            "name": "Alex Rivera",
+            "headline": "Backend Developer | Java | Spring Boot | SQL",
+            "education": {
+                "degree": "B.E.",
+                "field": "Information Technology",
+                "graduation_year": "2024",
+                "cgpa": "8.4",
+            },
+            "skills": ["Java", "Spring Boot", "SQL", "REST APIs", "PostgreSQL"],
+            "projects": [
+                {
+                    "name": "Order Processing Microservice",
+                    "description": "High-throughput Spring Boot and PostgreSQL order backend",
+                    "technologies": ["Java", "Spring Boot", "SQL"],
+                }
+            ],
+            "experience_preferences": {
+                "level": "entry_level",
+                "years_of_experience": 1,
+                "max_required_yoe": 2,
+                "accept_fresher": True,
+                "exclude_senior_titles": True,
+            },
+            "target_roles": ["Backend Developer", "Java Developer"],
+            "target_role_families": ["Backend Developer", "Backend Engineer", "Java Developer"],
+            "target_locations": ["Chennai", "Pune"],
+            "remote_preferences": {
+                "accept_remote": False,
+                "accept_hybrid_in_target_cities": True,
+                "home_country": "India",
+                "allowed_remote_regions": ["India"],
+            },
+            "excluded_companies": ["excludedbeta"],
+            "resume_path": str(self.java_resume),
+            "video_resume_url": "https://example.com/alex-intro",
+        }
+
+    def tearDown(self):
+        set_active_profile(None)
+        self.temp_dir.cleanup()
+
+    def test_colleague_profile_loads_from_file(self):
+        """TEST 2: A colleague's independently configured profile loads cleanly."""
+        profile_file = self.tmp_path / "colleague.profile.json"
+        profile_file.write_text(json.dumps(self.java_profile), encoding="utf-8")
+
+        loaded = load_profile(profile_file)
+        self.assertEqual(loaded["name"], "Alex Rivera")
+        self.assertEqual(loaded["target_roles"], ["Backend Developer", "Java Developer"])
+        self.assertEqual(loaded["target_locations"], ["Chennai", "Pune"])
+
+    def test_llm_prompt_reflects_active_profile_only(self):
+        """TEST 3: LLM prompt contains the active user's profile and skills, not another user's."""
+        sample_job = [
+            {
+                "title": "Java Developer",
+                "companyName": "FinTech Corp",
+                "location": "Chennai, India",
+                "description": "Build REST services using Java, Spring Boot, and SQL.",
+            }
+        ]
+        prompt = build_batch_prompt(sample_job, profile=self.java_profile)
+
+        self.assertIn("Alex Rivera", prompt)
+        self.assertIn("Spring Boot", prompt)
+        self.assertIn("Order Processing Microservice", prompt)
+        self.assertIn("Backend Developer", prompt)
+        self.assertNotIn("Jordan Patel", prompt)
+        self.assertNotIn("LangGraph", prompt)
+
+    def test_two_profiles_produce_different_contexts_and_role_filtering(self):
+        """TEST 4: Two different profiles produce different contexts, role relevance, and scores."""
+        java_job = {
+            "title": "Java Developer",
+            "companyName": "CloudPay",
+            "location": "Pune, India",
+            "description": "Backend APIs with Java, Spring Boot, SQL, and PostgreSQL. 0-2 years.",
+        }
+        ai_job = {
+            "title": "Applied AI Engineer",
+            "companyName": "GenLab",
+            "location": "Hyderabad, India",
+            "description": "Build RAG systems with Python, LangChain, LangGraph, FastAPI. 0-2 years.",
+        }
+
+        # Contexts differ
+        ctx_ai = build_candidate_profile_text(self.ai_profile)
+        ctx_java = build_candidate_profile_text(self.java_profile)
+        self.assertNotEqual(ctx_ai, ctx_java)
+        self.assertIn("LangChain", ctx_ai)
+        self.assertIn("Spring Boot", ctx_java)
+
+        # Role filtering differs
+        self.assertFalse(is_role_relevant(java_job["title"], java_job["description"], profile=self.ai_profile)[0])
+        self.assertTrue(is_role_relevant(java_job["title"], java_job["description"], profile=self.java_profile)[0])
+        self.assertTrue(is_role_relevant(ai_job["title"], ai_job["description"], profile=self.ai_profile)[0])
+        self.assertFalse(is_role_relevant(ai_job["title"], ai_job["description"], profile=self.java_profile)[0])
+
+        # Local scoring differs
+        ai_on_java = local_score_job(java_job, profile=self.ai_profile)["local_score"]
+        java_on_java = local_score_job(java_job, profile=self.java_profile)["local_score"]
+        self.assertGreater(java_on_java, ai_on_java)
+        self.assertGreaterEqual(java_on_java, 70)
+
+    def test_location_preferences_independent_per_profile(self):
+        """TEST 5: Location preferences are respected independently for each profile."""
+        chennai_job = {"location": "Chennai, Tamil Nadu, India"}
+        hyd_job = {"location": "Hyderabad, Telangana, India"}
+        pune_job = {"location": "Pune, Maharashtra, India"}
+        remote_job = {"location": "Remote - India"}
+
+        # AI profile (Hyderabad, Bengaluru, Mumbai, Remote)
+        self.assertFalse(is_valid_work_location(chennai_job, profile=self.ai_profile)[0])
+        self.assertTrue(is_valid_work_location(hyd_job, profile=self.ai_profile)[0])
+        self.assertFalse(is_valid_work_location(pune_job, profile=self.ai_profile)[0])
+        self.assertTrue(is_valid_work_location(remote_job, profile=self.ai_profile)[0])
+
+        # Java profile (Chennai, Pune only; accept_remote=False)
+        self.assertTrue(is_valid_work_location(chennai_job, profile=self.java_profile)[0])
+        self.assertFalse(is_valid_work_location(hyd_job, profile=self.java_profile)[0])
+        self.assertTrue(is_valid_work_location(pune_job, profile=self.java_profile)[0])
+        self.assertFalse(is_valid_work_location(remote_job, profile=self.java_profile)[0])
+
+    def test_company_exclusions_independent_per_profile(self):
+        """TEST 6: Company exclusions are independently respected per profile."""
+        self.assertTrue(is_company_excluded("ExcludedAlpha Technologies", profile=self.ai_profile)[0])
+        self.assertFalse(is_company_excluded("ExcludedBeta Corp", profile=self.ai_profile)[0])
+
+        self.assertFalse(is_company_excluded("ExcludedAlpha Technologies", profile=self.java_profile)[0])
+        self.assertTrue(is_company_excluded("ExcludedBeta Corp", profile=self.java_profile)[0])
+
+    def test_resume_attachment_uses_active_users_resume(self):
+        """TEST 7: Resume attachment attaches the active profile's resume file."""
+        recruiter = {
+            "name": "Priya Nair",
+            "title": "Technical Recruiter",
+            "company": "FinTech Systems",
+            "email": "priya@fintech.example",
+            "recruiter_score": 90,
+        }
+
+        sent_messages = []
+
+        class FakeSMTP:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def login(self, user, pwd):
+                pass
+
+            def send_message(self, msg):
+                sent_messages.append(msg)
+
+        with patch.object(outreach, "AUTO_SEND", True), \
+             patch.object(outreach, "GMAIL_USERNAME", "sender@example.com"), \
+             patch.object(outreach, "GMAIL_APP_PASSWORD", "app_pass"), \
+             patch("smtplib.SMTP_SSL", FakeSMTP):
+            subject, status = outreach.send_outreach_email(recruiter, profile=self.java_profile)
+
+        self.assertEqual(status, "sent")
+        self.assertEqual(len(sent_messages), 1)
+        attachments = list(sent_messages[0].iter_attachments())
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].get_filename(), "alex_java_resume.pdf")
+        self.assertEqual(attachments[0].get_payload(decode=True), b"%PDF-1.4\n%Alex Rivera Java Resume\n")
+
+    def test_outreach_uses_active_users_identity_and_qualifications(self):
+        """TEST 8: Recruiter outreach uses the active user's identity, education, skills, projects, and video URL."""
+        recruiter = {
+            "name": "Samir Rao",
+            "title": "Technical Recruiter",
+            "company": "PayStream",
+            "summary": "Hiring Java and Spring Boot backend engineers",
+        }
+        subject, body = outreach.build_email(recruiter, profile=self.java_profile)
+
+        self.assertIn("Alex Rivera", subject)
+        self.assertIn("Backend Developer", subject)
+        self.assertIn("Alex Rivera", body)
+        self.assertIn("2024 B.E. in Information Technology", body)
+        self.assertIn("Order Processing Microservice", body)
+        self.assertIn("Backend Developer and Java Developer", body)
+        self.assertIn("https://example.com/alex-intro", body)
+        self.assertNotIn("Jordan Patel", body)
+
+    def test_absent_or_invalid_profile_raises_clear_error(self):
+        """TEST 9: Missing, invalid JSON, or empty example profile raises ProfileConfigurationError."""
+        missing_path = self.tmp_path / "does_not_exist.json"
+        with self.assertRaises(ProfileConfigurationError) as ctx_missing:
+            load_profile(missing_path)
+        self.assertIn("config/profile.example.json", str(ctx_missing.exception))
+
+        bad_json_path = self.tmp_path / "bad.json"
+        bad_json_path.write_text("{not valid json", encoding="utf-8")
+        with self.assertRaises(ProfileConfigurationError) as ctx_bad:
+            load_profile(bad_json_path)
+        self.assertIn("Invalid JSON", str(ctx_bad.exception))
+
+        # Example template itself must exist, be valid JSON with empty values, and fail validation
+        self.assertTrue(PROFILE_EXAMPLE_PATH.exists(), "config/profile.example.json must exist")
+        example_data = json.loads(PROFILE_EXAMPLE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(example_data.get("name"), "")
+        self.assertEqual(example_data.get("target_roles"), [])
+        self.assertEqual(example_data.get("target_locations"), [])
+        self.assertEqual(example_data.get("excluded_companies"), [])
+        with self.assertRaises(ProfileConfigurationError) as ctx_empty:
+            validate_profile(example_data)
+        self.assertIn("Missing/invalid", str(ctx_empty.exception))
+
+        # main.main() fails loudly with exit code 1 if no profile is configured
+        with patch.object(config, "PROFILE_PRIVATE_PATH", missing_path), \
+             patch.dict(os.environ, {"PROFILE_PATH": "", "PROFILE_JSON": ""}, clear=False):
+            set_active_profile(None)
+            with self.assertRaises(SystemExit) as sys_cm:
+                main.main()
+            self.assertEqual(sys_cm.exception.code, 1)
+
+    def test_digest_apify_and_recruiter_matcher_use_active_profile(self):
+        """Verify email digest, Apify search payload, and recruiter matcher reflect active profile."""
+        jobs = [
+            {
+                "_job_id": "j_1",
+                "title": "Java Developer",
+                "companyName": "FinTech",
+                "location": "Chennai, India",
+                "match_score": 90,
+                "url": "https://example.com/1",
+                "description": "Java, Spring Boot, SQL",
+            },
+            {
+                "_job_id": "j_2",
+                "title": "Backend Developer",
+                "companyName": "CloudCo",
+                "location": "Pune, India",
+                "match_score": 88,
+                "url": "https://example.com/2",
+                "description": "Java, PostgreSQL",
+            },
+        ]
+        subj, html_body, text_body = build_email_digest(jobs, profile=self.java_profile)
+        self.assertIn("Chennai", subj)
+        self.assertIn("Pune", subj)
+        self.assertIn("Chennai", html_body)
+        self.assertIn("Spring Boot", text_body)
+        self.assertNotIn("Mumbai", subj)
+
+        # Apify query payload uses colleague's target roles and cities
+        with patch.object(main, "APIFY_TOKEN", "mock_tok"), \
+             patch("main.execute_apify_run", return_value=([], {"status": 200})) as mock_exec:
+            main.search_jobs_apify({"scraper_errors": []}, profile=self.java_profile)
+            payload_sent = mock_exec.call_args_list[0][0][0]
+            self.assertEqual(payload_sent["searchQueries"], ["Backend Developer", "Java Developer"])
+            self.assertEqual(payload_sent["locations"], ["Chennai", "Pune"])
+
+        # Recruiter matcher scores Java recruiter high for Java profile
+        java_recruiter = {
+            "name": "Anita Verma",
+            "title": "Technical Recruiter",
+            "headline": "Hiring Backend Developer and Java Developer with Spring Boot and SQL",
+            "email": "anita@example.com",
+            "recentlyPostedOnLinkedIn": True,
+        }
+        scored_rec = recruiter_matcher.score_recruiter(java_recruiter, profile=self.java_profile)
+        self.assertGreaterEqual(scored_rec["recruiter_score"], 85)
+
+    def test_sequential_profile_switching_and_state_isolation(self):
+        """Verify sequential switching via PROFILE_PATH/PROFILE_JSON and state isolation across profiles."""
+        path_a = self.tmp_path / "profile_a.json"
+        path_b = self.tmp_path / "profile_b.json"
+        path_a.write_text(json.dumps(self.ai_profile), encoding="utf-8")
+        path_b.write_text(json.dumps(self.java_profile), encoding="utf-8")
+
+        # Load A via PROFILE_PATH, then switch env var to B without manually clearing cache
+        with patch.dict(os.environ, {"PROFILE_PATH": str(path_a), "PROFILE_JSON": ""}):
+            active_a = get_active_profile()
+            self.assertEqual(active_a["name"], "Jordan Patel")
+
+        with patch.dict(os.environ, {"PROFILE_PATH": str(path_b), "PROFILE_JSON": ""}):
+            active_b = get_active_profile()
+            self.assertEqual(active_b["name"], "Alex Rivera")
+
+        # Load via PROFILE_JSON (GitHub Actions secret path)
+        with patch.object(config, "PROFILE_PRIVATE_PATH", self.tmp_path / "absent.json"), \
+             patch.dict(os.environ, {"PROFILE_PATH": "", "PROFILE_JSON": json.dumps(self.java_profile)}):
+            active_env = get_active_profile()
+            self.assertEqual(active_env["name"], "Alex Rivera")
+
+        # Sequential state isolation: job emailed under Profile A must NOT be suppressed or reuse score for Profile B
+        shared_state = {"jobs": {}}
+        now_utc = datetime.now(timezone.utc)
+        shared_job = {
+            "source_job_id": "cross_profile_001",
+            "title": "Software Engineer",
+            "companyName": "TechCo",
+            "location": "Hyderabad, India",
+            "url": "https://example.com/jobs/cross001",
+            "postedAt": "10 minutes ago",
+            "description": "Python, LangChain, Java, Spring Boot",
+        }
+        meta_a = {"jobs_within_freshness_window": 0, "stale_jobs_filtered": 0, "duplicates_skipped": 0, "email_retries": 0}
+        el_a = process_jobs_freshness_and_state([shared_job], shared_state, now_utc, meta_a, profile=self.ai_profile)
+        self.assertEqual(len(el_a), 1)
+        jid = el_a[0]["_job_id"]
+        shared_state["jobs"][jid]["status"] = "emailed"
+        shared_state["jobs"][jid]["match_score"] = 95
+
+        # Now Profile B runs against the same shared_state: must re-evaluate, not inherit Profile A's emailed/score!
+        meta_b = {"jobs_within_freshness_window": 0, "stale_jobs_filtered": 0, "duplicates_skipped": 0, "email_retries": 0}
+        el_b = process_jobs_freshness_and_state([dict(shared_job)], shared_state, now_utc, meta_b, profile=self.java_profile)
+        self.assertEqual(len(el_b), 1)
+        self.assertEqual(meta_b["duplicates_skipped"], 0)
+        self.assertFalse(el_b[0].get("_already_scored", False))
+
+    def test_missing_and_invalid_resume_handling(self):
+        """Verify optional missing resume works and invalid resume path fails gracefully on live send."""
+        recruiter = {
+            "name": "Samir Rao",
+            "title": "Technical Recruiter",
+            "company": "PayStream",
+            "email": "samir@paystream.example",
+            "recruiter_score": 90,
+        }
+
+        # 1. No resume configured: outreach succeeds without attachment and without claiming attachment
+        no_resume_profile = dict(self.ai_profile, resume_path="")
+        subj, body = outreach.build_email(recruiter, profile=no_resume_profile)
+        self.assertNotIn("I've attached my resume", body)
+        self.assertGreater(local_score_job({"title": "AI Engineer", "location": "Hyderabad", "description": "Python, LangChain, RAG"}, profile=no_resume_profile)["local_score"], 50)
+
+        # 2. Invalid/nonexistent resume path: does not claim attached; raises FileNotFoundError when AUTO_SEND=true
+        bad_resume_profile = dict(self.ai_profile, resume_path=str(self.tmp_path / "missing_resume.pdf"))
+        _, bad_body = outreach.build_email(recruiter, profile=bad_resume_profile)
+        self.assertNotIn("I've attached my resume", bad_body)
+
+        with patch.dict(os.environ, {"AUTO_SEND": "true", "GMAIL_USERNAME": "u@example.com", "GMAIL_APP_PASSWORD": "p"}):
+            with self.assertRaises(FileNotFoundError) as fnf_ctx:
+                outreach.send_outreach_email(recruiter, profile=bad_resume_profile)
+            self.assertIn("Configured resume file not found", str(fnf_ctx.exception))
 
 
 if __name__ == "__main__":

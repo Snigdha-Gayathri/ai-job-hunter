@@ -177,13 +177,67 @@ The pipeline protects Groq evaluation:
 - Python 3.11+
 - `pip install -r requirements.txt` (requires only `requests` and `beautifulsoup4`)
 
+### Configure Your Personal Profile
+Each user maintains their own independent profile configuration locally. Your personal file (`config/profile.private.json`) and resume files are git-ignored and never committed.
+
+1. Copy `config/profile.example.json`.
+2. Rename the copy to `config/profile.private.json`.
+3. Populate your personal details in `config/profile.private.json`:
+   - `name`, `headline`, `summary`: Your name, professional headline, and brief summary.
+   - `education`: `degree`, `field`, `institution`, `graduation_year`, `cgpa`.
+   - `skills`: `core` skill list and `categories` (`programming_languages`, `frameworks_and_libraries`, `databases`, `tools_and_platforms`, `specializations`).
+   - `work_experience`, `internships`, `projects`, `achievements`: Lists of roles, projects (string or `{name, description, technologies}`), and accomplishments.
+   - `experience_preferences`: `level` (e.g. `entry_level`, `mid`), `years_of_experience`, `max_required_yoe`, `accept_fresher`, `exclude_senior_titles`, `experience_keywords`.
+   - `target_roles`, `target_role_families`, `excluded_roles`: Preferred job titles, broader role families, and titles to reject.
+   - `target_locations`, `remote_preferences`: Preferred cities and remote settings (`accept_remote`, `accept_hybrid_in_target_cities`, `home_country`, `allowed_remote_regions`).
+   - `excluded_companies`: Company names or subsidiaries to exclude before matching.
+   - `resume_path`, `video_resume_url`: Local path to your resume (e.g. `assets/My_Resume.pdf`) and optional video introduction URL.
+4. Add your resume file at the local path configured in `resume_path` (for example under `assets/`).
+5. Configure your own API keys and email credentials via environment variables (or GitHub Actions secrets for automated runs).
+6. Run the job hunter (`python agent/main.py` or `python agent/main.py --dry-run`).
+
+### Configure Your Own GitHub Actions Secrets
+
+Every user must configure their own independent credentials and profile. The application never depends on or falls back to the repository owner's personal API keys, Gmail account, app password, or profile JSON.
+
+> [!IMPORTANT]
+> GitHub Actions secrets belong strictly to the repository in which the workflow runs. **Forking a repository does not automatically copy repository secrets.** When you run the workflows on your own fork or repository, they read **your** repository secrets, never the upstream repository's secrets.
+
+#### Required & Supported Repository Secrets
+
+| Secret | Purpose |
+|---|---|
+| `PROFILE_JSON` | The user's own candidate profile as JSON |
+| `GROQ_API_KEY` | The user's own Groq API key |
+| `APIFY_API_TOKEN` or `APIFY_API_KEY` | The user's own Apify credentials (the existing implementation checks `APIFY_API_KEY`, `APIFY_API_TOKEN`, and `APIFY_TOKEN`) |
+| `GMAIL_USERNAME` | The user's own Gmail address |
+| `GMAIL_APP_PASSWORD` | The user's own Gmail app password |
+
+Optional secrets consumed by existing workflows when set:
+- `VIDEO_RESUME_URL`: Used by `.github/workflows/recruiter-hourly.yml` (overrides `video_resume_url` from `PROFILE_JSON`).
+- `BRIGHT_DATA_API_KEY`: Used by `.github/workflows/hourly.yml` when `SCRAPER_PROVIDER=bright_data`.
+
+#### Step-by-Step Setup for Colleagues
+
+1. Fork this repository into your own GitHub account, or create your own repository from it.
+2. Clone your own repository locally.
+3. Copy `config/profile.example.json` to `config/profile.private.json` for local execution.
+4. Populate `config/profile.private.json` with your own candidate information.
+5. Configure your own API keys and Gmail credentials locally (for example, via environment variables or `.env`).
+6. For GitHub Actions, prepare your own profile JSON to store as the `PROFILE_JSON` repository secret (the contents of your `config/profile.private.json`).
+7. On GitHub, navigate to your repository's **Settings → Secrets and variables → Actions → New repository secret**.
+8. Add each required secret (`PROFILE_JSON`, `GROQ_API_KEY`, `APIFY_API_TOKEN` or `APIFY_API_KEY`, `GMAIL_USERNAME`, `GMAIL_APP_PASSWORD`) using your own credentials.
+9. Enable Actions on your fork if prompted, or manually trigger **Hourly AI Job Hunter** (`.github/workflows/hourly.yml`) / **Hourly AI Recruiter Hunter** (`.github/workflows/recruiter-hourly.yml`) via **Actions → Run workflow** after configuring the required secrets.
+
 ### Environment Variables
 | Variable | Required | Description |
 |---|---|---|
-| `GROQ_API_KEY` | **Yes** | Groq Cloud API key for LLaMA 3.3 70B evaluation. |
-| `GMAIL_USERNAME` | Optional | Gmail address for sending HTML alerts. |
-| `GMAIL_APP_PASSWORD` | Optional | 16-character Google App Password for Gmail SMTP. |
-| `APIFY_API_TOKEN` | Optional | Apify token for LinkedIn scraper actor. |
+| `GROQ_API_KEY` | **Yes** | Your own Groq Cloud API key for LLM job matching. |
+| `APIFY_API_KEY` / `APIFY_API_TOKEN` | **Yes** (CI) | Your own Apify token for LinkedIn job & recruiter discovery. |
+| `GMAIL_USERNAME` | **Yes** (CI) | Your own Gmail address for sending HTML job digests / outreach. |
+| `GMAIL_APP_PASSWORD` | **Yes** (CI) | Your own 16-character Google App Password for Gmail SMTP. |
+| `PROFILE_JSON` | **Yes** (CI) | JSON string of your candidate profile (used when `config/profile.private.json` is absent). |
+| `PROFILE_PATH` | Optional | Custom local path to a profile JSON file. |
 | `RUN_MODE` | Optional | Set to `worker` for continuous daemon execution. |
 
 ### Running Locally / Background Worker
@@ -199,7 +253,7 @@ python agent/main.py --dry-run
 ```
 
 ### GitHub Actions
-The workflow in `.github/workflows/hourly.yml` is scheduled to run every 15 minutes (`*/15 * * * *`). It restores persistent state from `agent/state/` via `actions/cache@v4` and enforces single-instance concurrency via `concurrency: group: ai-job-hunter`.
+The workflows in `.github/workflows/hourly.yml` (runs hourly at `:47` UTC / `:17` IST) and `.github/workflows/recruiter-hourly.yml` (runs hourly at `:15` UTC) validate required secrets upfront without printing secret values, restore persistent state via `actions/cache@v4`, and pass `PROFILE_JSON` securely via environment variables.
 
 ---
 

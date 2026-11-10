@@ -1,9 +1,11 @@
 import re
 
 from config import (
-    CANDIDATE_SKILLS,
     MIN_RECRUITER_SCORE,
-    TARGET_ROLES,
+    get_active_profile,
+    get_profile_roles,
+    get_profile_skills,
+    profile_targets_ai_roles,
 )
 
 
@@ -39,14 +41,6 @@ def _combined_text(recruiter):
     """
     Build searchable text from the entire recruiter
     record.
-
-    This lets us benefit from:
-    - headline
-    - title
-    - summary
-    - current company
-    - experience
-    - skills
     """
 
     parts = []
@@ -294,19 +288,24 @@ def normalize_recruiter(
 
 
 def score_recruiter(
-    recruiter
+    recruiter,
+    profile: dict | None = None,
 ):
     """
-    Deterministic recruiter relevance score.
+    Deterministic recruiter relevance score driven by the active user profile.
 
     Maximum = 100.
 
     30 points: recruiter role
-    30 points: AI/ML relevance
+    30 points: domain/specialization relevance
     20 points: matching target roles
     10 points: active LinkedIn presence
     10 points: usable work email
     """
+    active_profile = get_active_profile(profile)
+    target_roles = active_profile.get("target_roles") or get_profile_roles(active_profile)
+    candidate_skills = get_profile_skills(active_profile)
+    targets_ai = profile_targets_ai_roles(active_profile)
 
     recruiter = normalize_recruiter(
         recruiter
@@ -337,26 +336,31 @@ def score_recruiter(
         )
 
     # --------------------------------------------------------
-    # AI/ML RELEVANCE
+    # DOMAIN RELEVANCE
     # --------------------------------------------------------
 
-    ai_matches = _contains_any(
+    domain_keywords = (
+        AI_KEYWORDS
+        if targets_ai
+        else {str(r).lower() for r in target_roles} | {str(s).lower() for s in candidate_skills[:10]}
+    )
+    domain_matches = _contains_any(
         text,
-        AI_KEYWORDS,
+        domain_keywords,
     )
 
-    if ai_matches:
+    if domain_matches:
         score += min(
             30,
             10 + (
-                len(ai_matches) * 5
+                len(domain_matches) * 5
             ),
         )
 
         reasons.append(
-            "Profile shows AI/ML hiring relevance: "
+            "Profile shows domain hiring relevance: "
             + ", ".join(
-                ai_matches[:5]
+                domain_matches[:5]
             )
         )
 
@@ -366,7 +370,7 @@ def score_recruiter(
 
     target_matches = []
 
-    for role in TARGET_ROLES:
+    for role in target_roles:
         if role.lower() in text:
             target_matches.append(
                 role
@@ -388,7 +392,7 @@ def score_recruiter(
 
     skill_matches = []
 
-    for skill in CANDIDATE_SKILLS:
+    for skill in candidate_skills:
         if skill.lower() in text:
             skill_matches.append(
                 skill
@@ -458,7 +462,7 @@ def score_recruiter(
 
     recruiter[
         "ai_keyword_matches"
-    ] = ai_matches
+    ] = domain_matches
 
     recruiter[
         "target_role_matches"
@@ -472,12 +476,13 @@ def score_recruiter(
 
 
 def filter_and_rank_recruiters(
-    recruiters
+    recruiters,
+    profile: dict | None = None,
 ):
     """
-    Normalize, score and rank recruiters.
+    Normalize, score and rank recruiters against the active user profile.
     """
-
+    active_profile = get_active_profile(profile)
     scored = []
 
     for recruiter in recruiters:
@@ -487,7 +492,8 @@ def filter_and_rank_recruiters(
             )
 
             scored_recruiter = score_recruiter(
-                normalized
+                normalized,
+                profile=active_profile,
             )
 
             score = scored_recruiter.get(

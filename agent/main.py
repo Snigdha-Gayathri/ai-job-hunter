@@ -31,7 +31,6 @@ from sources import (
 )
 from config import (
     SOURCES_CONFIG,
-    EXCLUDED_COMPANIES,
     GROQ_BATCH_SIZE,
     MIN_MATCH_SCORE,
     MAX_EMAIL_SAFETY_CEILING,
@@ -40,10 +39,16 @@ from config import (
     FRESHNESS_WINDOW_MINUTES,
     FRESHNESS_WINDOW_HOURS,
     HIGH_PRIORITY_MAX_AGE_MINUTES,
-    TARGET_LOCATIONS as CONFIG_TARGET_LOCATIONS,
-    TARGET_ROLE_FAMILIES,
     APIFY_TOKEN,
+    ProfileConfigurationError,
+    get_active_profile,
     get_clean_apify_token,
+    get_profile_experience_prefs,
+    get_profile_fingerprint,
+    get_profile_locations,
+    get_profile_remote_prefs,
+    get_profile_roles,
+    get_profile_skills,
     verify_apify_auth,
 )
 from filters import (
@@ -101,23 +106,25 @@ def filter_jobs_by_company(
     jobs: list[dict],
     state: dict | None = None,
     run_metadata: dict | None = None,
+    profile: dict | None = None,
 ) -> list[dict]:
     """
     Hard Company Exclusion Filter:
-    Eliminates RestrictedCorp, RestrictedCorp Limited, RestrictedCorp BPM, and subsidiaries BEFORE Groq.
+    Eliminates companies configured in the active profile's excluded_companies BEFORE Groq.
     """
+    active_profile = get_active_profile(profile)
     accepted = []
     rejected_count = 0
     seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
 
     print()
     print("=" * 70)
-    print("EXCLUDED COMPANY FILTER (RestrictedCorp and variants)")
+    print("EXCLUDED COMPANY FILTER")
     print("=" * 70)
 
     for job in jobs:
         comp = job.get("companyName") or job.get("company") or ""
-        is_exc, reason = is_company_excluded(comp)
+        is_exc, reason = is_company_excluded(comp, profile=active_profile)
         jid = job.get("_job_id")
         title = job.get("title", "Unknown")
 
@@ -145,23 +152,26 @@ def filter_jobs_by_experience(
     jobs: list[dict],
     state: dict | None = None,
     run_metadata: dict | None = None,
+    profile: dict | None = None,
 ) -> list[dict]:
     """
-    Deterministic Experience Filter:
-    Accepts: fresher, 0-1, 0-2, 1-2 YOE, entry-level, intern, trainee.
-    Rejects: 3+, 4+, 5+, 7+, 8+ YOE, Senior, Lead, Principal, Architect BEFORE Groq.
+    Deterministic Experience Filter driven by the active profile's experience preferences.
     """
+    active_profile = get_active_profile(profile)
+    exp_prefs = get_profile_experience_prefs(active_profile)
+    max_yoe = exp_prefs.get("max_required_yoe")
+    level_label = exp_prefs.get("level") or "entry_level"
     accepted = []
     rejected_count = 0
     seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
 
     print()
     print("=" * 70)
-    print("EXPERIENCE FILTER (Fresher / Entry-Level / 0-2 YOE only)")
+    print(f"EXPERIENCE FILTER (Profile level: {level_label}, max_yoe: {max_yoe})")
     print("=" * 70)
 
     for job in jobs:
-        is_elig, reason = evaluate_experience_eligibility(job)
+        is_elig, reason = evaluate_experience_eligibility(job, profile=active_profile)
         jid = job.get("_job_id")
         title = job.get("title", "Unknown")
         comp = job.get("companyName") or job.get("company") or "Unknown"
@@ -190,22 +200,26 @@ def filter_jobs_by_strict_location(
     jobs: list[dict],
     state: dict | None = None,
     run_metadata: dict | None = None,
+    profile: dict | None = None,
 ) -> list[dict]:
     """
-    Strict Work-Location Filter:
-    Accepts ONLY jobs in Mumbai, Hyderabad, Bangalore/Bengaluru, Pune, or Remote.
+    Strict Work-Location Filter driven by the active profile's target_locations
+    and remote_preferences.
     """
+    active_profile = get_active_profile(profile)
+    locs = get_profile_locations(active_profile)
+    loc_label = ", ".join(locs) if locs else "Remote"
     accepted = []
     rejected_count = 0
     seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
 
     print()
     print("=" * 70)
-    print("STRICT WORK-LOCATION FILTER (Mumbai, Hyderabad, Bangalore, Pune, Remote)")
+    print(f"STRICT WORK-LOCATION FILTER ({loc_label})")
     print("=" * 70)
 
     for job in jobs:
-        is_valid, reason = is_valid_work_location(job)
+        is_valid, reason = is_valid_work_location(job, profile=active_profile)
         job_loc = job.get("location", "Unknown")
         title = job.get("title", "Unknown")
         comp = job.get("companyName") or job.get("company") or "Unknown"
@@ -236,25 +250,27 @@ def filter_jobs_by_role(
     jobs: list[dict],
     state: dict | None = None,
     run_metadata: dict | None = None,
+    profile: dict | None = None,
 ) -> list[dict]:
     """
-    Role Relevance Filter:
-    Matches all target AI/ML, GenAI, LLM, Agentic, Applied AI, CV, NLP roles.
-    Rejects clearly unrelated non-AI roles (Frontend, Java, QA, DevOps, etc.).
+    Role Relevance Filter driven by the active profile's target_roles,
+    target_role_families, and skills.
     """
+    active_profile = get_active_profile(profile)
+    roles_preview = ", ".join((active_profile.get("target_roles") or get_profile_roles(active_profile))[:4])
     accepted = []
     rejected_count = 0
     seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
 
     print()
     print("=" * 70)
-    print("ROLE RELEVANCE FILTER (AI/ML/GenAI/LLM/Agentic/Applied AI)")
+    print(f"ROLE RELEVANCE FILTER ({roles_preview})")
     print("=" * 70)
 
     for job in jobs:
         title = job.get("title", "")
         desc = job.get("description") or job.get("descriptionHtml") or ""
-        is_rel, reason = is_role_relevant(title, desc)
+        is_rel, reason = is_role_relevant(title, desc, profile=active_profile)
         jid = job.get("_job_id")
         comp = job.get("companyName") or job.get("company") or "Unknown"
 
@@ -731,11 +747,22 @@ def calculate_freshness(
 # SCRAPER INTEGRATION (APIFY & BRIGHT DATA)
 # ============================================================
 
-def search_jobs_brightdata(run_metadata: dict) -> list[dict]:
+def search_jobs_brightdata(
+    run_metadata: dict,
+    profile: dict | None = None,
+) -> list[dict]:
     """
     Live on-demand scrape using Bright Data LinkedIn Jobs Scraper API.
     Used when BRIGHT_DATA_API_KEY is configured.
     """
+    from urllib.parse import quote_plus
+
+    active_profile = get_active_profile(profile)
+    roles = (active_profile.get("target_roles") or get_profile_roles(active_profile))[:2]
+    remote_prefs = get_profile_remote_prefs(active_profile)
+    locs = get_profile_locations(active_profile)
+    search_loc = remote_prefs.get("home_country") or (locs[0] if locs else "Remote")
+
     print()
     print("=" * 70)
     print("BRIGHT DATA LIVE LINKEDIN SCRAPER")
@@ -751,20 +778,15 @@ def search_jobs_brightdata(run_metadata: dict) -> list[dict]:
         "Content-Type": "application/json",
     }
 
-    # Pass targeted LinkedIn search URL with 2-hour filter and sort by date
+    # Pass targeted LinkedIn search URLs built from active profile roles & location
     payload = [
         {
             "url": (
                 "https://www.linkedin.com/jobs/search/?"
-                "keywords=AI+Engineer&location=India&f_TPR=r7200&sortBy=DD"
+                f"keywords={quote_plus(role)}&location={quote_plus(search_loc)}&f_TPR=r7200&sortBy=DD"
             )
-        },
-        {
-            "url": (
-                "https://www.linkedin.com/jobs/search/?"
-                "keywords=Machine+Learning+Engineer&location=India&f_TPR=r7200&sortBy=DD"
-            )
-        },
+        }
+        for role in roles
     ]
 
     print(f"Triggering synchronous scrape via Bright Data ({url})...")
@@ -1116,24 +1138,54 @@ def inspect_and_log_jobs(
     return summary
 
 
-def search_jobs_apify(run_metadata: dict) -> list[dict]:
+def search_jobs_apify(
+    run_metadata: dict,
+    profile: dict | None = None,
+) -> list[dict]:
     """
     Live on-demand scrape using Apify actor 'automation-lab~linkedin-jobs-scraper'.
 
-    Production search configuration:
-    - sortBy: 'DD' (Most Recent)
-    - datePosted: 'r86400' (Past 24 hours max window)
-    - startUrls with f_TPR=r7200 (Past 2 hours) and sortBy=DD
-    - searchQueries for targeted AI/ML roles in India
-
-    Empirical testing protocol:
-    1. Executes Run 1 against live Apify actor and inspects all returned jobs.
-    2. Waits 120 seconds.
-    3. Executes Run 2 against live Apify actor and inspects all returned jobs.
-    4. Compares Actor Run IDs, returned Job IDs, and posting timestamps to determine:
-       - Whether the actor actually performs a fresh scrape on every API call.
-       - Whether returned results can include jobs posted within the preceding hour.
+    Builds searchQueries, locations, and startUrls dynamically from the active user profile.
     """
+    from urllib.parse import quote_plus
+
+    active_profile = get_active_profile(profile)
+    roles = (active_profile.get("target_roles") or get_profile_roles(active_profile))[:10]
+    locs = get_profile_locations(active_profile)
+    remote_prefs = get_profile_remote_prefs(active_profile)
+    exp_prefs = get_profile_experience_prefs(active_profile)
+
+    if remote_prefs.get("accept_remote") and "remote" not in {l.lower() for l in locs}:
+        locs = locs + ["Remote"]
+
+    home_country = remote_prefs.get("home_country") or (locs[0] if locs else "Remote")
+    cities = [l for l in locs if l.lower() not in ("remote", "worldwide", "anywhere", "global")]
+
+    start_urls: list[dict] = []
+    for city in cities[:4]:
+        for role in roles[:4]:
+            start_urls.append(
+                {
+                    "url": (
+                        "https://www.linkedin.com/jobs/search/?"
+                        f"keywords={quote_plus(role)}&location={quote_plus(city)}&f_TPR=r86400&sortBy=DD"
+                    )
+                }
+            )
+    if remote_prefs.get("accept_remote"):
+        for role in roles[:4]:
+            if len(start_urls) >= 20:
+                break
+            start_urls.append(
+                {
+                    "url": (
+                        "https://www.linkedin.com/jobs/search/?"
+                        f"keywords={quote_plus(role)}&location={quote_plus(home_country)}&f_WT=2&f_TPR=r86400&sortBy=DD"
+                    )
+                }
+            )
+    start_urls = start_urls[:20]
+
     print()
     print("=" * 80)
     print("APIFY LIVE LINKEDIN SCRAPER - EMPIRICAL ACQUISITION VERIFICATION")
@@ -1148,77 +1200,28 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
 
     params = {"token": active_token}
 
-    # Targeted multi-partition production search configuration across required cities & AI role families
+    # Targeted multi-partition production search configuration from active profile
     payload = {
-        "searchQuery": "AI Engineer",
-        "searchQueries": [
-            "AI Engineer",
-            "Machine Learning Engineer",
-            "Generative AI Engineer",
-            "LLM Engineer",
-            "Agentic AI Engineer",
-            "AI/ML Engineer",
-            "Applied AI Engineer",
-            "AI Developer",
-            "AI Intern",
-            "Machine Learning Intern",
-        ],
-        "keywords": [
-            "AI Engineer",
-            "Machine Learning Engineer",
-            "Generative AI Engineer",
-            "LLM Engineer",
-            "Agentic AI Engineer",
-            "AI/ML Engineer",
-            "Applied AI Engineer",
-            "AI Developer",
-            "AI Intern",
-            "Machine Learning Intern",
-        ],
-        "locations": [
-            "Mumbai",
-            "Hyderabad",
-            "Bangalore",
-            "Bengaluru",
-            "Pune",
-            "Remote",
-        ],
-        "location": "India",
+        "searchQuery": roles[0] if roles else "Software Engineer",
+        "searchQueries": roles,
+        "keywords": roles,
+        "locations": locs,
+        "location": home_country,
         "maxItems": MAX_SCRAPED_JOBS,
         "maxJobs": MAX_SCRAPED_JOBS,
         "jobType": "F",
-        "experienceLevel": "2",  # Entry level
         "datePosted": "r86400",  # Past 24 hours max window
         "sortBy": "DD",  # Most Recent
         "scrapeJobDetails": os.environ.get("APIFY_SCRAPE_JOB_DETAILS", "false").lower() == "true",
-        "startUrls": [
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Engineer&location=Bengaluru&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Engineer&location=Bengaluru&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Generative+AI+Engineer&location=Bengaluru&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=LLM+Engineer&location=Bengaluru&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Engineer&location=Hyderabad&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Engineer&location=Hyderabad&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Generative+AI+Engineer&location=Hyderabad&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Engineer&location=Pune&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Engineer&location=Pune&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Generative+AI+Engineer&location=Pune&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Engineer&location=Mumbai&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Engineer&location=Mumbai&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Generative+AI+Engineer&location=Mumbai&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Engineer&location=India&f_WT=2&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Engineer&location=India&f_WT=2&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Generative+AI+Engineer&location=India&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=LLM+Engineer&location=India&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Agentic+AI+Engineer&location=India&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=AI+Intern&location=India&f_TPR=r86400&sortBy=DD"},
-            {"url": "https://www.linkedin.com/jobs/search/?keywords=Machine+Learning+Intern&location=India&f_TPR=r86400&sortBy=DD"},
-        ],
+        "startUrls": start_urls,
     }
+    if exp_prefs.get("accept_fresher"):
+        payload["experienceLevel"] = "2"  # Entry level
 
     print("Search Configuration:")
     print("  sortBy:           'DD' (Most Recent)")
     print("  datePosted:       'r86400' (Past 24 hours)")
-    print(f"  startUrls:        {len(payload['startUrls'])} multi-partition URLs (Mumbai, Hyd, Blr, Pune, Remote)")
+    print(f"  startUrls:        {len(payload['startUrls'])} multi-partition URLs ({', '.join(locs)})")
     print(f"  scrapeJobDetails: {payload['scrapeJobDetails']}")
     print(f"  searchQueries:    {payload['searchQueries']}")
 
@@ -1238,16 +1241,10 @@ def search_jobs_apify(run_metadata: dict) -> list[dict]:
             print()
             print("[APIFY FALLBACK] startUrls yielded 0 jobs. Running direct search queries fallback...")
             fallback_payload = {
-                "searchQuery": "AI Engineer",
-                "searchQueries": [
-                    "AI Engineer",
-                    "Machine Learning Engineer",
-                    "Generative AI Engineer",
-                    "LLM Engineer",
-                    "AI Intern",
-                ],
-                "locations": ["Bangalore", "Hyderabad", "Pune", "Mumbai", "Remote"],
-                "location": "India",
+                "searchQuery": roles[0] if roles else "Software Engineer",
+                "searchQueries": roles[:5],
+                "locations": locs,
+                "location": home_country,
                 "maxItems": 50,
                 "maxJobs": 50,
                 "datePosted": "r86400",
@@ -1385,6 +1382,7 @@ def search_jobs(
     run_metadata: dict,
     state: dict | None = None,
     force_all: bool = False,
+    profile: dict | None = None,
 ) -> list[dict]:
     """
     Multi-source acquisition dispatcher with ThreadPoolExecutor concurrency:
@@ -1393,6 +1391,7 @@ def search_jobs(
     3. Failure in any single source is fully isolated and does not crash the pipeline.
     4. Independent timeout, failure handling, and latency logging per source.
     """
+    active_profile = get_active_profile(profile)
     discovered_at = datetime.now(timezone.utc)
     source_states = state.setdefault("sources", {}) if state is not None else {}
     tagged_jobs = []
@@ -1438,10 +1437,10 @@ def search_jobs(
         try:
             if provider_pref == "bright_data" and BRIGHT_DATA_API_KEY:
                 run_metadata["scraper_provider"] = "bright_data"
-                raw = search_jobs_brightdata(run_metadata)
+                raw = search_jobs_brightdata(run_metadata, profile=active_profile)
             elif APIFY_TOKEN:
                 run_metadata["scraper_provider"] = "apify"
-                raw = search_jobs_apify(run_metadata)
+                raw = search_jobs_apify(run_metadata, profile=active_profile)
             else:
                 return "linkedin", "LinkedIn (Apify)", [], "UNAVAILABLE", round(time.time() - t_li, 2), "APIFY_API_TOKEN not configured"
             if run_metadata.get("apify_usage_limited"):
@@ -1546,18 +1545,25 @@ def process_jobs_freshness_and_state(
     state: dict,
     discovered_at: datetime,
     run_metadata: dict,
+    profile: dict | None = None,
 ) -> list[dict]:
     """
     Processes raw jobs through freshness calculation and state management.
 
     Distinguishes:
-    1. Previously processed job (status == 'emailed'): SKIP
+    1. Previously processed job (status == 'emailed'): SKIP (scoped to active profile fingerprint)
     2. Failed email attempt (status == 'email_failed'): RETRY ELIGIBLE!
     3. Previously seen but not successfully emailed (status == 'discovered'): RETRY ELIGIBLE!
     4. Newly discovered job: Calculate freshness and process
     5. Stale job: Record as stale, DO NOT email
     6. Multi-source deduplication: Collapses same job across multiple sources
     """
+    active_fp = ""
+    try:
+        active_fp = get_profile_fingerprint(get_active_profile(profile))
+    except ProfileConfigurationError:
+        active_fp = ""
+
     seen_jobs = state.setdefault("jobs", {})
     eligible_jobs = []
     current_run_seen_ids = set()
@@ -1603,11 +1609,14 @@ def process_jobs_freshness_and_state(
             job_id = existing_id
             job["_job_id"] = existing_id
 
-        # Deduplication check:
+        rec_fp = existing_record.get("profile_fingerprint") if existing_record else None
+        same_profile = (not rec_fp) or (not active_fp) or (rec_fp == active_fp)
+
+        # Deduplication check (scoped to the same profile fingerprint):
         # - "emailed": permanently skip to avoid repeat alert spam!
         # - "email_abandoned": permanently skip after exceeding max retry attempts.
         # - "email_failed", "qualified", "discovered", and recent "rejected": retain eligibility!
-        if existing_record and existing_record.get("status") in (
+        if existing_record and same_profile and existing_record.get("status") in (
             "emailed",
             "email_abandoned",
         ):
@@ -1620,7 +1629,7 @@ def process_jobs_freshness_and_state(
             continue
 
         # Check retry limit for failed email attempts (max 3 retries)
-        if existing_record and existing_record.get("status") == "email_failed":
+        if existing_record and same_profile and existing_record.get("status") == "email_failed":
             attempts = existing_record.get("email_attempts", 0)
             if attempts >= 3:
                 existing_record["status"] = "email_abandoned"
@@ -1657,38 +1666,53 @@ def process_jobs_freshness_and_state(
             if source_name not in seen_sources:
                 seen_sources.append(source_name)
 
-            if prev_status == "email_failed":
+            if not same_profile:
+                # State record belonged to a different profile: reset evaluation & score for active profile
+                existing_record["profile_fingerprint"] = active_fp
+                existing_record["status"] = "discovered"
+                existing_record["email_attempts"] = 0
+                existing_record.pop("match_score", None)
+                existing_record.pop("qualification", None)
+                existing_record.pop("priority", None)
                 print(
-                    f"[RETRY ELIGIBLE] '{job.get('title')}' at "
-                    f"'{job.get('companyName') or job.get('company')}' (Prior status: email_failed)"
-                )
-                run_metadata["email_retries"] += 1
-            elif prev_status == "qualified":
-                print(
-                    f"[QUALIFIED RETRY] '{job.get('title')}' at "
-                    f"'{job.get('companyName') or job.get('company')}' (Prior status: qualified)"
-                )
-                run_metadata["email_retries"] += 1
-            elif prev_status == "rejected":
-                print(
-                    f"[RE-EVALUATING] '{job.get('title')}' at "
-                    f"'{job.get('companyName') or job.get('company')}' (Previously marked rejected)"
-                )
-            else:
-                print(
-                    f"[DISCOVERED RETRY] '{job.get('title')}' at "
+                    f"[PROFILE SWITCH RE-EVAL] '{job.get('title')}' at "
                     f"'{job.get('companyName') or job.get('company')}'"
                 )
+            else:
+                if active_fp and not existing_record.get("profile_fingerprint"):
+                    existing_record["profile_fingerprint"] = active_fp
 
-            # Only reuse prior match score if the job was ALREADY qualified and waiting for email retry
-            # Never bypass AI matching on re-evaluating rejected or un-scored discovered candidates!
-            if prev_status in ("qualified", "email_failed") and existing_record.get("match_score", 0) >= MIN_MATCH_SCORE:
-                job["match_score"] = existing_record.get("match_score")
-                job["qualification"] = existing_record.get("qualification", "GOOD_MATCH")
-                job["priority"] = existing_record.get("priority", "HIGH")
-                job["matcher_path"] = existing_record.get("matcher_path", "CACHED")
-                job["groq_status"] = existing_record.get("groq_status", "PREVIOUSLY_QUALIFIED")
-                job["_already_scored"] = True
+                if prev_status == "email_failed":
+                    print(
+                        f"[RETRY ELIGIBLE] '{job.get('title')}' at "
+                        f"'{job.get('companyName') or job.get('company')}' (Prior status: email_failed)"
+                    )
+                    run_metadata["email_retries"] += 1
+                elif prev_status == "qualified":
+                    print(
+                        f"[QUALIFIED RETRY] '{job.get('title')}' at "
+                        f"'{job.get('companyName') or job.get('company')}' (Prior status: qualified)"
+                    )
+                    run_metadata["email_retries"] += 1
+                elif prev_status == "rejected":
+                    print(
+                        f"[RE-EVALUATING] '{job.get('title')}' at "
+                        f"'{job.get('companyName') or job.get('company')}' (Previously marked rejected)"
+                    )
+                else:
+                    print(
+                        f"[DISCOVERED RETRY] '{job.get('title')}' at "
+                        f"'{job.get('companyName') or job.get('company')}'"
+                    )
+
+                # Only reuse prior match score if the job was ALREADY qualified for the same profile
+                if prev_status in ("qualified", "email_failed") and existing_record.get("match_score", 0) >= MIN_MATCH_SCORE:
+                    job["match_score"] = existing_record.get("match_score")
+                    job["qualification"] = existing_record.get("qualification", "GOOD_MATCH")
+                    job["priority"] = existing_record.get("priority", "HIGH")
+                    job["matcher_path"] = existing_record.get("matcher_path", "CACHED")
+                    job["groq_status"] = existing_record.get("groq_status", "PREVIOUSLY_QUALIFIED")
+                    job["_already_scored"] = True
         else:
             print(
                 f"[FRESH DISCOVERY] '{job.get('title')}' at "
@@ -1702,6 +1726,7 @@ def process_jobs_freshness_and_state(
             seen_jobs[job_id] = {
                 "job_id": job_id,
                 "source_job_id": job.get("source_job_id") or job_id,
+                "profile_fingerprint": active_fp,
                 "title": str(job.get("title") or ""),
                 "company": str(
                     job.get("companyName")
@@ -1755,6 +1780,7 @@ def score_and_rank_jobs(
     jobs: list[dict],
     run_metadata: dict,
     state: dict | None = None,
+    profile: dict | None = None,
 ) -> list[dict]:
     """
     Batched AI/Groq matching (or deterministic local fallback).
@@ -1766,6 +1792,7 @@ def score_and_rank_jobs(
         print("No jobs available for matching.")
         return []
 
+    active_profile = get_active_profile(profile)
     candidates = jobs
     run_metadata["candidates_surviving_filter"] = len(candidates)
     seen_jobs = state.setdefault("jobs", {}) if state is not None else {}
@@ -1786,10 +1813,10 @@ def score_and_rank_jobs(
         print(f"AI BATCH MATCHING (GROQ / LOCAL FALLBACK) - {len(unscored_candidates)} candidates")
         print("=" * 70)
 
-        scored_new = score_jobs_batch(unscored_candidates)
+        scored_new = score_jobs_batch(unscored_candidates, profile=active_profile)
         if scored_new:
             for j in scored_new:
-                j["priority"] = classify_priority(j)
+                j["priority"] = classify_priority(j, profile=active_profile)
                 jid = j.get("_job_id")
                 if jid and jid in seen_jobs:
                     score = j.get("match_score", 0)
@@ -1890,34 +1917,49 @@ def format_source_name(source: str | None) -> str:
     return sources_map.get(s, s.title() if s else "Direct")
 
 
-def get_single_job_location_name(job: dict) -> str:
+def get_single_job_location_name(
+    job: dict,
+    profile: dict | None = None,
+) -> str:
     """
     Extract a concise city or remote indicator for single-job email subject lines.
     """
-    loc = str(job.get("location") or "").lower()
+    active_profile = get_active_profile(profile)
+    raw_loc = str(job.get("location") or "").strip()
+    loc = raw_loc.lower()
     wp = str(
         job.get("workplace")
         or job.get("workplaceType")
         or job.get("remote_type")
         or ""
     ).lower()
-    if "pune" in loc:
-        return "Pune"
-    if "mumbai" in loc or "bombay" in loc:
-        return "Mumbai"
-    if "hyderabad" in loc or "secunderabad" in loc:
-        return "Hyderabad"
+
+    for target_loc in get_profile_locations(active_profile):
+        t_low = target_loc.lower()
+        if t_low in ("remote", "worldwide", "anywhere", "global"):
+            continue
+        if t_low in loc:
+            return target_loc.title() if target_loc.islower() else target_loc
+
     if "bengaluru" in loc or "bangalore" in loc:
         return "Bangalore"
     if "remote" in loc or "remote" in wp:
         return "Remote"
-    return "India"
+    if raw_loc:
+        return raw_loc.split(",")[0].strip()
+    remote_prefs = get_profile_remote_prefs(active_profile)
+    return remote_prefs.get("home_country") or "Remote"
 
 
-def extract_key_skills(job: dict) -> list[str]:
+def extract_key_skills(
+    job: dict,
+    profile: dict | None = None,
+) -> list[str]:
     """
-    Extract clean, concise technical skill keywords for display.
+    Extract clean, concise technical skill keywords for display from job and active profile.
     """
+    active_profile = get_active_profile(profile)
+    profile_skills = get_profile_skills(active_profile)
     skills = []
     seen = set()
 
@@ -1925,7 +1967,7 @@ def extract_key_skills(job: dict) -> list[str]:
         name_clean = name.strip()
         if not name_clean:
             return
-        acronyms = {"ai", "ml", "llm", "llms", "rag", "nlp", "gpu", "mlops", "api"}
+        acronyms = {"ai", "ml", "llm", "llms", "rag", "nlp", "gpu", "mlops", "api", "sql", "rest"}
         if name_clean.lower() in acronyms:
             formatted = name_clean.upper() if name_clean.lower() != "llms" else "LLMs"
         elif name_clean.lower() == "fastapi":
@@ -1940,6 +1982,8 @@ def extract_key_skills(job: dict) -> list[str]:
             formatted = "LangGraph"
         elif name_clean.lower() == "scikit-learn":
             formatted = "scikit-learn"
+        elif any(c.isupper() for c in name_clean):
+            formatted = name_clean
         else:
             formatted = name_clean.title()
 
@@ -1957,18 +2001,13 @@ def extract_key_skills(job: dict) -> list[str]:
         if km_clean and len(km_clean.split()) <= 3:
             add_skill(km_clean)
 
-    # 3. From text overlap with core AI/ML tech stack
+    # 3. From text overlap with active profile skills
     text = (str(job.get("title") or "") + " " + str(job.get("description") or "")).lower()
-    core_techs = [
-        "Python", "Machine Learning", "PyTorch", "TensorFlow", "LLMs", "Generative AI",
-        "RAG", "FastAPI", "Docker", "Agentic AI", "LangChain", "Vector Databases",
-        "MLOps", "Qdrant", "Pinecone", "Deep Learning",
-    ]
-    for tech in core_techs:
-        if tech.lower() in text and tech.lower() not in seen:
+    for tech in profile_skills:
+        if re.search(rf"(?<!\w){re.escape(tech.lower())}(?!\w)", text) and tech.lower() not in seen:
             add_skill(tech)
 
-    return skills[:8] if skills else ["Python", "Machine Learning", "LLMs", "FastAPI"]
+    return skills[:8] if skills else profile_skills[:4]
 
 
 def format_why_it_matches(job: dict) -> str:
@@ -1979,7 +2018,7 @@ def format_why_it_matches(job: dict) -> str:
     raw = job.get("match_reason") or job.get("reason") or ""
     raw = re.sub(r"^(why it matches:?\s*)+", "", raw, flags=re.IGNORECASE).strip()
     if not raw:
-        return "The role focuses on ML/AI development matching your AI/ML background and technical skills."
+        return "The role aligns with your configured profile, target roles, and technical skills."
 
     # Split into sentences and take first 1 or 2
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw) if s.strip()]
@@ -2025,12 +2064,37 @@ def format_job_age(job: dict) -> str:
     return f"{raw_age} ago"
 
 
+def _format_digest_locations(profile: dict) -> str:
+    """Format deduplicated display location summary from the active profile."""
+    raw_locs = get_profile_locations(profile)
+    remote_prefs = get_profile_remote_prefs(profile)
+    seen: set[str] = set()
+    display: list[str] = []
+
+    alias_canonical = {
+        "bengaluru": "bangalore",
+        "bombay": "mumbai",
+        "secunderabad": "hyderabad",
+        "gurugram": "gurgaon",
+    }
+    for loc in raw_locs:
+        low = loc.lower()
+        key = alias_canonical.get(low, low)
+        if key not in seen:
+            seen.add(key)
+            display.append("Bangalore" if key == "bangalore" else (loc.title() if loc.islower() else loc))
+    if remote_prefs.get("accept_remote") and "remote" not in seen:
+        display.append("Remote")
+    return " · ".join(display)
+
+
 def build_email_digest(
     jobs: list[dict],
     now_utc: datetime | None = None,
+    profile: dict | None = None,
 ) -> tuple[str, str, str]:
     """
-    Builds the clean Job Alert Digest email.
+    Builds the clean Job Alert Digest email using the active user profile.
     Returns: (subject, html_content, text_content)
 
     Features:
@@ -2043,12 +2107,21 @@ def build_email_digest(
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
 
+    active_profile = get_active_profile(profile)
+    loc_summary = _format_digest_locations(active_profile)
+    remote_prefs = get_profile_remote_prefs(active_profile)
+    default_loc = remote_prefs.get("home_country") or "Remote"
+
     count = len(jobs)
     if count == 1:
-        loc_name = get_single_job_location_name(jobs[0])
-        subject = f"AI Job Hunter | 1 New AI Match | {loc_name}"
+        loc_name = get_single_job_location_name(jobs[0], profile=active_profile)
+        subject = f"AI Job Hunter | 1 New Match | {loc_name}"
     else:
-        subject = f"AI Job Hunter | {count} New Matches | Mumbai · Hyderabad · Bangalore · Pune · Remote"
+        subject = (
+            f"AI Job Hunter | {count} New Matches | {loc_summary}"
+            if loc_summary
+            else f"AI Job Hunter | {count} New Matches"
+        )
 
     match_word = "match" if count == 1 else "matches"
 
@@ -2058,14 +2131,14 @@ def build_email_digest(
     for index, job in enumerate(jobs, start=1):
         title = html.escape(str(job.get("title") or "Unknown Title"))
         comp = html.escape(str(job.get("companyName") or job.get("company") or "Unknown Company"))
-        loc = html.escape(str(job.get("location") or "India"))
+        loc = html.escape(str(job.get("location") or default_loc))
         source_name = format_source_name(job.get("source"))
         source_html = html.escape(source_name)
         score = int(job.get("match_score", 0))
         age_str = format_job_age(job)
         why_matches = format_why_it_matches(job)
         why_matches_html = html.escape(why_matches)
-        skills = extract_key_skills(job)
+        skills = extract_key_skills(job, profile=active_profile)
         skills_str = " · ".join(skills)
         skills_str_html = html.escape(skills_str)
 
@@ -2128,7 +2201,7 @@ def build_email_digest(
         text_card = f"""{job.get('title', 'Unknown Title')}
 {job.get('companyName') or job.get('company', 'Unknown Company')}
 
-📍 {job.get('location', 'India')}
+📍 {job.get('location', default_loc)}
 🕐 Posted {age_str}
 Source: {source_name}
 
@@ -2144,6 +2217,12 @@ Why it matches:
 
     cards_joined = "\n\n".join(cards_html)
     separator = "─" * 60
+    footer_monitoring_html = (
+        f"<div>Monitoring {html.escape(loc_summary).replace(' · ', ' &middot; ')}</div>"
+        if loc_summary
+        else ""
+    )
+    footer_monitoring_text = f"Monitoring {loc_summary}" if loc_summary else ""
 
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -2168,7 +2247,7 @@ Why it matches:
 
     <div style="margin-top: 36px; padding-top: 20px; border-top: 1px solid #e2e8f0; text-align: center; color: #94a3b8; font-size: 13px; line-height: 1.6;">
       <div style="font-weight: 600; color: #64748b; margin-bottom: 4px;">AI Job Hunter</div>
-      <div>Monitoring Mumbai &middot; Hyderabad &middot; Bangalore &middot; Pune &middot; Remote</div>
+      {footer_monitoring_html}
     </div>
   </div>
 </body>
@@ -2184,7 +2263,7 @@ Why it matches:
 {separator}
 
 AI Job Hunter
-Monitoring Mumbai · Hyderabad · Bangalore · Pune · Remote"""
+{footer_monitoring_text}""".rstrip()
 
     return subject, html_content, text_content
 
@@ -2193,6 +2272,7 @@ def send_email_report(
     jobs: list[dict],
     run_metadata: dict,
     state: dict,
+    profile: dict | None = None,
 ):
     """
     Send clean Job Alert Digest via Gmail SMTP.
@@ -2235,6 +2315,7 @@ def send_email_report(
     subject, html_content, text_content = build_email_digest(
         jobs_to_send,
         now_utc=now_utc,
+        profile=profile,
     )
 
     message = EmailMessage()
@@ -2299,19 +2380,21 @@ def send_email_report(
 def run_pipeline_once(
     state: dict,
     force_all: bool = False,
+    profile: dict | None = None,
 ) -> tuple[list[dict], dict]:
     """
-    Executes a single end-to-end acquisition cycle:
+    Executes a single end-to-end acquisition cycle using the active user profile:
     1. Multi-source acquisition (LinkedIn Apify, Remote boards, ATS endpoints).
     2. Freshness & Cross-Source Deduplication.
-    3. Hard Company Filter (Reject RestrictedCorp and variants BEFORE Groq).
-    4. Deterministic Experience Filter (Fresher / 0-2 YOE only BEFORE Groq).
-    5. Strict Work-Location Filter (Mumbai, Hyderabad, Bangalore, Pune, Remote).
-    6. Role Relevance Filter (AI/ML/GenAI/LLM/Agentic/Applied AI).
+    3. Hard Company Filter (Reject profile-excluded companies BEFORE Groq).
+    4. Deterministic Experience Filter (Profile experience preferences BEFORE Groq).
+    5. Strict Work-Location Filter (Profile target locations & remote prefs).
+    6. Role Relevance Filter (Profile target roles, role families & skills).
     7. Batched AI/Groq Matching (or deterministic local fallback) in batches of 15.
     8. Sends immediate Gmail notifications for ALL qualifying jobs (no arbitrary cap).
     9. Persists state atomically.
     """
+    active_profile = get_active_profile(profile)
     start_time = datetime.now(timezone.utc)
 
     run_metadata = {
@@ -2350,7 +2433,7 @@ def run_pipeline_once(
     try:
         # 1. Multi-source acquisition
         t0 = time.time()
-        raw_jobs = search_jobs(run_metadata, state=state, force_all=force_all)
+        raw_jobs = search_jobs(run_metadata, state=state, force_all=force_all, profile=active_profile)
         t_retrieval = round(time.time() - t0, 2)
         run_metadata["latency_retrieval_sec"] = t_retrieval
 
@@ -2361,43 +2444,48 @@ def run_pipeline_once(
             state,
             start_time,
             run_metadata,
+            profile=active_profile,
         )
         t_dedup = round(time.time() - t1, 2)
         run_metadata["latency_dedup_sec"] = t_dedup
 
-        # 3. Hard Company Filter (Reject RestrictedCorp and variants BEFORE Groq)
+        # 3. Hard Company Filter (Reject excluded companies BEFORE Groq)
         t_comp = time.time()
         company_passed_jobs = filter_jobs_by_company(
             eligible_jobs,
             state=state,
             run_metadata=run_metadata,
+            profile=active_profile,
         )
         run_metadata["latency_company_sec"] = round(time.time() - t_comp, 2)
 
-        # 4. Deterministic Experience Filter (Fresher / 0-2 YOE only BEFORE Groq)
+        # 4. Deterministic Experience Filter
         t_exp = time.time()
         exp_passed_jobs = filter_jobs_by_experience(
             company_passed_jobs,
             state=state,
             run_metadata=run_metadata,
+            profile=active_profile,
         )
         run_metadata["latency_experience_sec"] = round(time.time() - t_exp, 2)
 
-        # 5. Strict Work-Location Filter (Mumbai, Hyderabad, Bangalore, Pune, Remote)
+        # 5. Strict Work-Location Filter
         t_loc = time.time()
         location_passed_jobs = filter_jobs_by_strict_location(
             exp_passed_jobs,
             state=state,
             run_metadata=run_metadata,
+            profile=active_profile,
         )
         run_metadata["latency_location_sec"] = round(time.time() - t_loc, 2)
 
-        # 6. Role Relevance Filter (AI/ML/GenAI/LLM/Agentic/Applied AI)
+        # 6. Role Relevance Filter
         t_role = time.time()
         role_passed_jobs = filter_jobs_by_role(
             location_passed_jobs,
             state=state,
             run_metadata=run_metadata,
+            profile=active_profile,
         )
         run_metadata["latency_role_sec"] = round(time.time() - t_role, 2)
 
@@ -2407,6 +2495,7 @@ def run_pipeline_once(
             role_passed_jobs,
             run_metadata,
             state=state,
+            profile=active_profile,
         )
         t_matching = round(time.time() - t2, 2)
         run_metadata["latency_matching_sec"] = t_matching
@@ -2424,6 +2513,7 @@ def run_pipeline_once(
                 jobs=matched_jobs,
                 run_metadata=run_metadata,
                 state=state,
+                profile=active_profile,
             )
         else:
             print()
@@ -2618,7 +2708,7 @@ def print_run_summary(run_metadata: dict, start_time: datetime, end_time: dateti
     print("REJECTIONS & DEDUPLICATION SUMMARY")
     print("-" * 80)
     print(f"Deduplicated (Skipped):        {dedup_count}")
-    print(f"Rejected by Company (RestrictedCorp): {comp_rejected}")
+    print(f"Rejected by Company Exclusion: {comp_rejected}")
     print(f"Rejected by Experience:        {exp_rejected}")
     print(f"Rejected by Location:          {loc_rejected}")
     print(f"Rejected by Role Relevance:    {role_rejected}")
@@ -2649,6 +2739,12 @@ def run_worker_loop():
     Continuously polls sources every ~15 minutes in a durable background loop.
     Survives unexpected errors and catches signals cleanly.
     """
+    try:
+        get_active_profile()
+    except ProfileConfigurationError as cfg_err:
+        print(f"CONFIGURATION ERROR: {cfg_err}")
+        sys.exit(1)
+
     poll_interval_sec = int(os.environ.get("WORKER_POLL_INTERVAL_SECONDS", "900"))
     print("=" * 80)
     print("AI JOB HUNTER - PERSISTENT WORKER STARTED (PRODUCTION PERSISTENT DAEMON)")
@@ -2686,6 +2782,12 @@ def main():
     Standard one-shot execution used by GitHub Actions and scheduled runs.
     Performs exactly ONE complete job-hunting cycle and exits.
     """
+    try:
+        get_active_profile()
+    except ProfileConfigurationError as cfg_err:
+        print(f"CONFIGURATION ERROR: {cfg_err}")
+        sys.exit(1)
+
     start_time = datetime.now(timezone.utc)
     print("=" * 80)
     print("AI JOB HUNTER - ONE-SHOT EXECUTION CYCLE")

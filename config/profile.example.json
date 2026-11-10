@@ -1,0 +1,47 @@
+{
+  "name": "",
+  "headline": "",
+  "summary": "",
+  "education": {
+    "degree": "",
+    "field": "",
+    "institution": "",
+    "graduation_year": "",
+    "cgpa": ""
+  },
+  "skills": {
+    "core": [],
+    "categories": {
+      "programming_languages": [],
+      "frameworks_and_libraries": [],
+      "databases": [],
+      "tools_and_platforms": [],
+      "specializations": []
+    }
+  },
+  "work_experience": [],
+  "internships": [],
+  "projects": [],
+  "achievements": [],
+  "experience_preferences": {
+    "level": "",
+    "years_of_experience": null,
+    "max_required_yoe": null,
+    "accept_fresher": false,
+    "exclude_senior_titles": false,
+    "experience_keywords": []
+  },
+  "target_roles": [],
+  "target_role_families": [],
+  "excluded_roles": [],
+  "target_locations": [],
+  "remote_preferences": {
+    "accept_remote": false,
+    "accept_hybrid_in_target_cities": false,
+    "home_country": "",
+    "allowed_remote_regions": []
+  },
+  "excluded_companies": [],
+  "resume_path": "",
+  "video_resume_url": ""
+}

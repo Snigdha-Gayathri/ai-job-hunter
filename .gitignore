@@ -6,3 +6,11 @@ __pycache__/
 .DS_Store
 agent/state/
 state/
+
+# Private user profiles and local resumes
+config/profile.private.json
+*.private.json
+assets/
+*.pdf
+*.doc
+*.docx
